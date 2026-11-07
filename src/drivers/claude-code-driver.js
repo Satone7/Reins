@@ -81,6 +81,50 @@ export class ClaudeCodeDriver {
     this.tmuxSessions = new Map();
   }
 
+  async listModels() {
+    return {
+      targetId: this.targetConfig.id || 'claude-code',
+      kind: 'claude-code',
+      currentConfig: {
+        model: this.targetConfig.model || null,
+        effort: this.targetConfig.effort || null,
+        provider: 'anthropic',
+      },
+      models: [
+        {
+          id: 'sonnet',
+          model: 'sonnet',
+          displayName: 'Claude Sonnet',
+          description: 'Balanced intelligence and speed for everyday coding tasks.',
+          isDefault: true,
+          defaultEffort: 'medium',
+          supportedEfforts: ['low', 'medium', 'high', 'max'],
+          inputModalities: ['text', 'image'],
+        },
+        {
+          id: 'opus',
+          model: 'opus',
+          displayName: 'Claude Opus',
+          description: 'Frontier model for complex architecture and deep reasoning.',
+          isDefault: false,
+          defaultEffort: 'high',
+          supportedEfforts: ['low', 'medium', 'high', 'max'],
+          inputModalities: ['text', 'image'],
+        },
+        {
+          id: 'haiku',
+          model: 'haiku',
+          displayName: 'Claude Haiku',
+          description: 'Fast and lightweight model for quick tasks.',
+          isDefault: false,
+          defaultEffort: 'low',
+          supportedEfforts: ['low', 'medium', 'high'],
+          inputModalities: ['text', 'image'],
+        },
+      ],
+    };
+  }
+
   _transportConfig() {
     return this.targetConfig.transport;
   }
@@ -154,6 +198,10 @@ export class ClaudeCodeDriver {
     ];
     if (snapshot.sessionId) args.push('--resume', snapshot.sessionId);
     if (snapshot.sessionMode === 'ephemeral') args.push('--no-session-persistence');
+    const effectiveModel = snapshot.model || this.targetConfig.model;
+    const effectiveEffort = snapshot.effort || this.targetConfig.effort;
+    if (effectiveModel) args.push('--model', effectiveModel);
+    if (effectiveEffort) args.push('--effort', effectiveEffort);
     args.push('--permission-mode', PERMISSION_MODES[snapshot.reinPolicy] || 'default');
 
     const env = { ...(this.targetConfig.env || {}), ...envVars };

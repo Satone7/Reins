@@ -36,6 +36,10 @@ targets:
       mode: codex-app-server
       command: auto   # Resolves `codex` on PATH or Windows Store Appx `app/resources/codex.exe`
       args: ["app-server", "--stdio"]
+    # Optional target-level model and reasoning effort defaults (falls back to ~/.codex/config.toml if omitted)
+    # Query available choices dynamically via: `reins models local-codex`
+    # model: gpt-6.1-sol
+    # effort: high    # low | medium | high | xhigh | max | ultra
     workspace:
       defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
       allowedSyncModes: [remote-native, context-only]

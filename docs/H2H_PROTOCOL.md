@@ -33,10 +33,10 @@ Reins exposes **two 100% isomorphic Northbound Surfaces**—**CLI + Agent Skill 
 
 | Reins Concept | MCP Tool (`reins-mcp`) | CLI Subcommand (`reins` + `SKILL.md`) | DSH Equivalent (`dsh-subagent`) | OpenAI Equivalent (`codex-plugin-cc` / `mcp`) | `dsh-claude-vps` Equivalent | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Target** | `reins_targets` | `reins targets [--json]` | `list_agents` / `providerName` | `/codex:setup` | `claude_vps_status` (targets) | Discover configured local/remote Harness targets and active/resumable sessions. |
-| **Hand Over** | `reins_delegate` | `reins delegate <target> [options]` | `subagent_<provider>` | `codex` / `task` / `review` | `claude_vps_start` + `claude_vps_send` | Delegate a task to a target Harness (foreground wait with graceful background fallback). |
+| **Target & Models** | `reins_targets` (`includeModels`) | `reins targets [--json]`<br>`reins models [targetId] [--json]` | `list_agents` / `providerName` | `/codex:setup` / `model/list` + `config/read` | `claude_vps_status` (targets) | Discover configured local/remote Harness targets, active/resumable sessions, and selectable models + reasoning efforts. |
+| **Hand Over** | `reins_delegate` | `reins delegate <target> [options]` | `subagent_<provider>` | `codex` / `task` / `review` | `claude_vps_start` + `claude_vps_send` | Delegate a task to a target Harness (with optional `--model` and `--effort` selection). |
 | **Inspect** | `reins_status` | `reins status [taskId] [options]` | `list_agents` / `job_output` | `status` / `result` | `claude_vps_status` + `claude_vps_read` | Query task status, incremental transcript (`sinceSeq`), pending approval dialogs, and final output. |
-| **Steer** | `reins_steer` | `reins steer <taskId> <action> [msg]` | `send_message` | `codex-reply` / Approval RPC | `claude_vps_send` / `claude_vps_key` | **Unified Control Primitive**:<br>1. When `attention_required`: approve/deny permission prompts (`approve` / `approve_session` / `deny`);<br>2. When `completed`/`idle`: send follow-up turn (`reply`);<br>3. When `working`: inject mid-turn steering instruction. |
+| **Steer** | `reins_steer` | `reins steer <taskId> <action> [msg]` | `send_message` | `codex-reply` / Approval RPC | `claude_vps_send` / `claude_vps_key` | **Unified Control Primitive**:<br>1. When `attention_required`: approve/deny permission prompts (`approve` / `approve_session` / `deny`);<br>2. When `completed`/`idle`: send follow-up turn (`reply`, optionally switching `--model` / `--effort`);<br>3. When `working`: inject mid-turn steering instruction. |
 | **Pull the Reins** | `reins_abort` | `reins abort <taskId> [--kill]` | `interrupt_agent` / `job_kill` | `cancel` / `turn/interrupt` | `claude_vps_interrupt` / `stop` | Interrupt the active turn (keeps underlying session resumable by default unless `--kill` / `terminateSession: true` is passed). |
 
 ---
@@ -96,6 +96,87 @@ Reins defines **5 standard `ReinPolicy` levels** and automatically translates th
 
 ---
 
+## 4.5 Model Catalog Discovery & Reasoning Effort Selection (`H2HModelCatalog` & `ReasoningEffort`)
+
+Different tasks require different cost, latency, and reasoning depth trade-offs (e.g., selecting a lightweight model with `low` effort for an `ephemeral` summary export vs. selecting a frontier model with `high`/`xhigh`/`ultra` effort for a complex `persistent` architectural refactoring or adversarial review). Reins H2H standardizes **dynamic model discovery** and **per-session / per-turn model & effort selection**.
+
+### 4.5.1 Canonical `ReasoningEffort` Vocabulary
+
+```typescript
+export type ReasoningEffort =
+  | 'low'     // Fast responses with lighter reasoning
+  | 'medium'  // Balanced speed and reasoning depth for everyday tasks
+  | 'high'    // Greater reasoning depth for complex problems
+  | 'xhigh'   // Extra high reasoning depth for complex problems
+  | 'max'     // Maximum reasoning depth
+  | 'ultra';  // Ultra-deep frontier reasoning (supported on Codex Sol/Astra/Terra models)
+```
+
+### 4.5.2 Canonical Model Catalog Schema (`H2HModelCatalog`)
+
+Querying a target via CLI (`reins models [targetId] --json`), MCP (`reins_targets({ targetId, includeModels: true })`), or Hub HTTP (`GET /models?targetId=<id>`) returns an **`H2HModelCatalog`**:
+
+```typescript
+export interface H2HModelDescriptor {
+  /** Canonical model identifier passed via --model / model (e.g. 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna') */
+  readonly id: string;
+  readonly model: string;
+  /** Human-readable display name (e.g. 'GPT-6.1-Sol') */
+  readonly displayName: string;
+  /** Model capability summary */
+  readonly description: string;
+  /** True if marked as the catalog-wide default model by the Harness server */
+  readonly isDefault: boolean;
+  /** Default reasoning effort for this model when effort is not explicitly overridden */
+  readonly defaultEffort: ReasoningEffort | null;
+  /** Supported reasoning effort levels for this specific model */
+  readonly supportedEfforts: ReasoningEffort[];
+  /** Human-readable descriptions for each supported reasoning effort */
+  readonly effortDetails?: Array<{
+    readonly effort: ReasoningEffort;
+    readonly description: string;
+  }>;
+  /** Supported input modalities (e.g. ['text', 'image']) */
+  readonly inputModalities: string[];
+}
+
+export interface H2HModelCatalog {
+  readonly targetId: string;
+  readonly kind: 'codex' | 'antigravity' | 'dsh' | 'claude-code' | 'acp';
+  /** Active user/target defaults prior to per-task overrides */
+  readonly currentConfig: {
+    readonly model: string | null;
+    readonly effort: ReasoningEffort | null;
+    readonly provider: string | null;
+  };
+  readonly models: H2HModelDescriptor[];
+}
+```
+
+### 4.5.3 Four-Tier Model & Effort Resolution Precedence
+
+When a task is delegated (`reins_delegate`) or steered (`reins_steer`), the effective `model` and `effort` are resolved in strict priority order:
+
+1. **Tier 1 — Per-Turn / Per-Task Explicit Override** (`delegate.model` / `delegate.effort` or `steer.model` / `steer.effort`):
+   Highest precedence. Allows callers to pick `model` and `effort` at session creation time, or dynamically upgrade/downgrade `model` and `effort` on follow-up turns (`reins steer <taskId> reply --model ... --effort ...`).
+2. **Tier 2 — Target Configuration Default in `reins.yaml`** (`targets.<id>.model` / `targets.<id>.effort`):
+   Target-specific baseline configured in Reins Hub.
+3. **Tier 3 — Native Harness User Configuration**:
+   The user's local/remote Harness settings (e.g., `~/.codex/config.toml` `model` and `model_reasoning_effort` read via `config/read`).
+4. **Tier 4 — Harness Catalog Default**:
+   The catalog entry with `isDefault: true` and its `defaultReasoningEffort`.
+
+### 4.5.4 Southbound Wire Mapping for Model Discovery & Selection
+
+| Target Harness | Model & Effort Discovery Mechanism | Session Start / Resume Wire Mapping (`delegate`) | Mid-Session Turn Wire Mapping (`steer reply`) |
+| :--- | :--- | :--- | :--- |
+| **1. OpenAI Codex**<br>(`codex-app-server`) | JSON-RPC `model/list` (`{}`) + `config/read` (`{ includeLayers: false }`) over stdio or SSH | `thread/start` & `thread/resume`:<br>• `model: effectiveModel`<br>• `config: { model_reasoning_effort: effectiveEffort }`<br>Records returned `res.model` & `res.reasoningEffort` onto `snapshot`. | `turn/start`:<br>• `model: effectiveModel`<br>• `effort: effectiveEffort` |
+| **2. Antigravity**<br>(`agentapi` / `agy-cli`) | Configured target catalog (`inherit`, `flash_lite`, `flash`, `pro`) | `agentapi new-conversation --model=<model>` or `agy --model <model>` | Preserves conversation model or passes `--model <model>` on CLI resume |
+| **3. DeepSeek Harness**<br>(`acp` / `dsh-headless`) | Configured target catalog / `~/.dsh` profile | ACP `session/new` `_meta.model` or `dsh --profile headless --model <model>` | Subsequent `session/prompt` or `--session-id <id> --model <model>` |
+| **4. Claude Code**<br>(`claude-tmux` / `claude-print`) | Standard aliases (`sonnet`, `opus`, `haiku`) & efforts (`low`, `medium`, `high`, `max`) | `claude --model <model> --effort <effort>` | `claude --resume <sessionId> --model <model> --effort <effort>` |
+
+---
+
 ## 5. H2H Task State Machine & Result Envelope (`H2HTaskSnapshot`)
 
 ### 5.1 Task Lifecycle State Machine
@@ -133,6 +214,10 @@ export interface H2HTaskSnapshot {
   readonly sessionMode: 'persistent' | 'ephemeral';
   /** Effective ReinPolicy governing this task */
   readonly reinPolicy: 'free-rein' | 'auto-edit' | 'parent-rein' | 'tight-rein' | 'plan-only';
+  /** Effective model identifier used for this session/turn (e.g. 'gpt-6.1-sol', 'gpt-6-luna', 'flash_lite') */
+  readonly model?: string;
+  /** Effective reasoning effort level used for this session/turn */
+  readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 
   /** Underlying native Harness session metadata for human/agent handoff */
   readonly nativeSession: {
@@ -296,34 +381,36 @@ Reins provides two 100% isomorphic Northbound entry points backed by the same `r
 
 ### 8.1 The Five Core Primitives: MCP Tools vs. CLI Subcommands
 
-#### ① `reins_targets` / `reins targets`
-Lists configured local/remote Harness targets, capabilities, and active/resumable tasks.
+#### ① `reins_targets` / `reins targets` & `reins models`
+Lists configured local/remote Harness targets, capabilities, active/resumable tasks, and selectable model catalogs.
 
-| Semantic | MCP Parameter (`reins_targets`) | CLI Option (`reins targets`) | Description |
+| Semantic | MCP Parameter (`reins_targets`) | CLI Option (`reins targets` / `reins models`) | Description |
 | :--- | :--- | :--- | :--- |
+| Target ID | `targetId?: string` | `reins models [targetId]` | Inspect a specific target and query its live `H2HModelCatalog` (defaults to `local-codex` in `reins models`). |
+| Include models | `includeModels?: boolean` | `reins models [targetId]` | When `true` (or when `targetId` is passed), queries selectable models, supported `ReasoningEffort` levels, and current user defaults. |
 | Filter by tag | `filterTag?: string` | `--tag <tag>` | Filter targets by capability tag (e.g. `coding`, `review`). |
 | Include sessions | `includeSessions?: boolean` (default `true`) | `--no-sessions` | Whether to include active and resumable tasks. |
-| Output format | *(Structured JSON + rendered text)* | `--json` | Outputs strict JSON when `--json` is set; compact table otherwise. |
+| Output format | *(Structured JSON + rendered text)* | `--json` | Outputs strict JSON when `--json` is set; human-readable list otherwise. |
 
 #### ② `reins_delegate` / `reins delegate`
 Delegates a task to a target Harness or resumes an existing session.
 
 | Semantic | MCP Parameter (`reins_delegate`) | CLI Option (`reins delegate <target>`) | Description |
 | :--- | :--- | :--- | :--- |
-| Target ID | `target: string` **(required)** | `<target>` **(positional 1)** | Target node ID (e.g. `local-codex`, `local-agy`, `local-dsh`, `faex1-claude`). |
+| Target ID | `targetId: string` **(required)** | `<target>` **(positional 1)** | Target node ID (e.g. `local-codex`, `local-agy`, `local-dsh`, `faex1-claude`). |
 | Task prompt | `prompt: string` **(required)** | `-p, --prompt <text>` or<br>`-f, --prompt-file <path>` or<br>`--prompt-stdin` | Full instructions for the target Harness. **CLI supports file and `stdin` input to avoid PowerShell/Bash quoting pitfalls.** |
 | Short title | `description?: string` | `-d, --desc <text>` | 3–8 word task title (compatible with DSH `description`). |
 | Workflow preset | `preset?: 'task' \| 'review' \| 'adversarial-review' \| 'rescue'` | `--preset <name>` | `task`/`rescue` default to `persistent`; `review`/`adversarial-review` default to `ephemeral` + `plan-only` policy. |
 | Session mode | `sessionMode?: 'persistent' \| 'ephemeral'`<br>*(alias `continuable?: boolean`)* | `--persistent` or `--ephemeral` (`--one-shot`) | `persistent`: saved in user's native Harness session list for multi-turn/human resume. `ephemeral`: one-shot execution without session list clutter. |
-| Working dir | `workdir?: string` | `-C, --workdir <path>` | Override target working directory. |
+| Working dir | `cwd?: string` | `--cwd <path>` | Override target working directory. |
 | Workspace mode | `workspaceMode?: 'remote-native' \| 'git-patch' \| 'context-only'` | `--workspace-mode <mode>` | Default `remote-native`. |
 | Rein policy | `reinPolicy?: 'free-rein' \| 'auto-edit' \| 'parent-rein' \| 'tight-rein' \| 'plan-only'` | `--policy <policy>` | Override target's default `ReinPolicy`. |
-| Model override | `model?: string` | `-m, --model <id>` | Optional model override. |
-| Reasoning effort | `reasoningEffort?: 'low' \| 'medium' \| 'high' \| 'max'` | `--effort <level>` | Optional reasoning effort override. |
-| Resume session | `sessionId?: string` | `-s, --session <id>` | Resume an existing native session ID (`threadId` / `uuid`). |
+| Model override | `model?: string` | `--model <id>` | Optional model override (e.g. `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `flash_lite`). |
+| Reasoning effort | `effort?: 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max' \| 'ultra'` | `--effort <level>` | Optional reasoning effort override (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`). |
+| Resume session | `sessionId?: string` | `--session <id>` | Resume an existing native session ID (`threadId` / `uuid`). |
 | Attach tmux | `attachTmux?: string` | `--attach-tmux <name>` | Attach to an existing remote tmux session (`claude-tmux` only). |
-| Run in background | `runInBackground?: boolean` (default `false`) | `-b, --bg` | Return `taskId` immediately after submission. |
-| Foreground wait | `waitSec?: number` (default `60`) | `-w, --wait <sec>` | Max foreground wait seconds. **If exceeded, transitions smoothly to background and returns `H2HTaskSnapshot` with `timedOutWaiting: true` instead of failing.** |
+| Run in background | `wait?: boolean` (default `true`) | `--wait` / `--bg` | When `--bg` (`wait: false`), spawns detached worker and returns `taskId` immediately. |
+| Turn timeout | `timeoutSec?: number` (default `600`) | `--timeout <sec>` | Max turn duration in seconds. |
 | JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |
 
 #### ③ `reins_status` / `reins status`
@@ -331,10 +418,10 @@ Queries the latest `H2HTaskSnapshot`, incremental transcript messages, and pendi
 
 | Semantic | MCP Parameter (`reins_status`) | CLI Option (`reins status [taskId]`) | Description |
 | :--- | :--- | :--- | :--- |
-| Task ID | `taskId?: string` | `[taskId]` or `--all` | Target task ID, or list all tasks when omitted/`--all`. |
-| Long-poll wait | `waitSec?: number` (default `0`) | `-w, --wait <sec>` | Wait up to `waitSec` seconds until the task settles or enters `attention_required`. |
-| Message cursor | `sinceSeq?: number` | `--since-seq <n>` | Return only transcript messages with `seq > sinceSeq`. |
-| Pane tail | `includePaneTail?: boolean` (default `false`) | `--pane` | Include raw terminal pane lines (`paneTail`). |
+| Task ID | `taskId?: string` | `[taskId]` | Target task ID, or list recent tasks when omitted. |
+| Status filter | `status?: string` | `--status <status>` | Filter task list by status (`running`, `completed`, `attention_required`, etc.). |
+| Target filter | `targetId?: string` | `--target <targetId>` | Filter task list by target ID. |
+| Limit | `limit?: number` (default `20`) | `--limit <n>` | Maximum number of tasks to return when listing. |
 | JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |
 
 #### ④ `reins_steer` / `reins steer`
@@ -343,9 +430,11 @@ Approves/denies an `attention_required` permission request, sends a follow-up tu
 | Semantic | MCP Parameter (`reins_steer`) | CLI Option (`reins steer <taskId> <action>`) | Description |
 | :--- | :--- | :--- | :--- |
 | Task ID | `taskId: string` **(required)** | `<taskId>` **(positional 1)** | Target task ID. |
-| Action | `action: 'reply' \| 'approve' \| 'approve_session' \| 'deny'` **(required)** | `<action>` **(positional 2)** | `approve` (allow once), `approve_session` (allow for session), `deny` (reject), or `reply` (follow-up prompt / steer). |
-| Message text | `message?: string` | `-m, --message <text>` or<br>`-f, --message-file <path>` or<br>`--message-stdin` | Required when `action === 'reply'`; optional reason when `action === 'deny'`. |
-| Foreground wait | `waitSec?: number` (default `60`) | `-w, --wait <sec>` / `-b, --bg` | Wait up to `waitSec` seconds for the steered turn to progress. |
+| Action | `action: 'reply' \| 'approve' \| 'reject' \| 'interrupt'` **(required)** | `<action>` **(positional 2)** | `approve` (allow tool call), `reject` (decline tool call), `interrupt` (abort active turn), or `reply` (follow-up prompt / multi-turn continuation). |
+| Message text | `message?: string` | `[message]` or `-p, --prompt <text>` or `--prompt-file <path>` or `--prompt-stdin` | Follow-up prompt when `action === 'reply'`. |
+| Model override | `model?: string` | `--model <id>` | Optional model switch for the steered follow-up turn. |
+| Reasoning effort | `effort?: 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max' \| 'ultra'` | `--effort <level>` | Optional reasoning effort switch for the steered follow-up turn. |
+| Foreground wait | `wait?: boolean` (default `true`) | `--wait` / `--bg` | Whether to wait for the steered turn to complete. |
 | JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |
 
 #### ⑤ `reins_abort` / `reins abort`

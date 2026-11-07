@@ -42,6 +42,40 @@ export class DshDriver {
     this.activeSessions = new Map();
   }
 
+  async listModels() {
+    return {
+      targetId: this.targetConfig.id || 'local-dsh',
+      kind: 'dsh',
+      currentConfig: {
+        model: this.targetConfig.model || 'deepseek-chat',
+        effort: this.targetConfig.effort || null,
+        provider: 'deepseek',
+      },
+      models: [
+        {
+          id: 'deepseek-chat',
+          model: 'deepseek-chat',
+          displayName: 'DeepSeek V3 / Chat',
+          description: 'General-purpose coding and agentic tool-use model.',
+          isDefault: true,
+          defaultEffort: 'medium',
+          supportedEfforts: ['low', 'medium', 'high'],
+          inputModalities: ['text'],
+        },
+        {
+          id: 'deepseek-reasoner',
+          model: 'deepseek-reasoner',
+          displayName: 'DeepSeek R1 / Reasoner',
+          description: 'Deep reasoning model for complex analysis and debugging.',
+          isDefault: false,
+          defaultEffort: 'high',
+          supportedEfforts: ['medium', 'high', 'max'],
+          inputModalities: ['text'],
+        },
+      ],
+    };
+  }
+
   async runTurn(snapshot, { prompt, envVars = {}, timeoutMs = 600000 }, onUpdate = () => {}) {
     const configuredArgs = Array.isArray(this.targetConfig.args) ? this.targetConfig.args : [];
     if (this.targetConfig.driver === 'dsh-headless' || configuredArgs.includes('headless')) {

@@ -83,6 +83,60 @@ export class AntigravityDriver {
     this.activeSessions = new Map();
   }
 
+  async listModels() {
+    return {
+      targetId: this.targetConfig.id || 'local-agy',
+      kind: 'antigravity',
+      currentConfig: {
+        model: this.targetConfig.model || 'flash_lite',
+        effort: this.targetConfig.effort || null,
+        provider: 'google',
+      },
+      models: [
+        {
+          id: 'flash_lite',
+          model: 'flash_lite',
+          displayName: 'Gemini Flash Lite',
+          description: 'Low-latency, high-throughput model for fast tasks.',
+          isDefault: this.targetConfig.model === 'flash_lite',
+          defaultEffort: 'low',
+          supportedEfforts: ['low', 'medium', 'high'],
+          inputModalities: ['text', 'image'],
+        },
+        {
+          id: 'flash',
+          model: 'flash',
+          displayName: 'Gemini Flash',
+          description: 'Balanced speed and reasoning model.',
+          isDefault: this.targetConfig.model === 'flash',
+          defaultEffort: 'medium',
+          supportedEfforts: ['low', 'medium', 'high'],
+          inputModalities: ['text', 'image'],
+        },
+        {
+          id: 'pro',
+          model: 'pro',
+          displayName: 'Gemini Pro',
+          description: 'Deep reasoning model for complex engineering work.',
+          isDefault: this.targetConfig.model === 'pro',
+          defaultEffort: 'high',
+          supportedEfforts: ['low', 'medium', 'high'],
+          inputModalities: ['text', 'image'],
+        },
+        {
+          id: 'inherit',
+          model: 'inherit',
+          displayName: 'Inherit Parent Model',
+          description: 'Inherits the active model of the parent Antigravity workspace.',
+          isDefault: !this.targetConfig.model || this.targetConfig.model === 'inherit',
+          defaultEffort: null,
+          supportedEfforts: [],
+          inputModalities: ['text', 'image'],
+        },
+      ],
+    };
+  }
+
   async runTurn(snapshot, { prompt, envVars = {}, timeoutMs = 600000 }, onUpdate = () => {}) {
     const startedAt = Date.now();
     const transportConfig = this.targetConfig.transport;
