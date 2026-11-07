@@ -24,7 +24,7 @@ function runCommand({ command, args, cwd, env, transportConfig, timeoutMs, onLin
   const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
   const executable = isSsh ? 'ssh' : resolveExecutable(command, 'claude-code');
   const commandArgs = isSsh
-    ? buildSshArgs(transportConfig, buildPosixCommandLine(command, args, cwd, env))
+    ? ['-n', ...buildSshArgs(transportConfig, buildPosixCommandLine(command, args, cwd, env))]
     : args;
 
   return new Promise((resolve) => {

@@ -98,6 +98,20 @@ export function resolveExecutable(commandSpec = 'auto', harnessKind = 'codex') {
     return commandSpec;
   }
 
+  if (harnessKind === 'antigravity' && ['auto', 'agy', 'agentapi'].includes(commandSpec)) {
+    const agentApi = path.join(
+      os.homedir(), '.gemini', 'antigravity', 'bin',
+      process.platform === 'win32' ? 'agentapi.bat' : 'agentapi',
+    );
+    if (fs.existsSync(agentApi)) return agentApi;
+    if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+      const languageServer = path.join(
+        process.env.LOCALAPPDATA, 'Programs', 'antigravity', 'resources', 'bin', 'language_server.exe',
+      );
+      if (fs.existsSync(languageServer)) return languageServer;
+    }
+  }
+
   const defaultBinaryByKind = {
     codex: 'codex',
     'claude-code': 'claude',

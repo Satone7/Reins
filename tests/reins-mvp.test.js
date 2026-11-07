@@ -49,16 +49,20 @@ test('SSH arguments include connection settings and destination', () => {
   assert.throws(() => buildSshArgs({ host: '-oProxyCommand=bad' }, 'pwd'), /valid host/);
 });
 
-test('SSH command line quotes cwd and arguments and exports REINS variables', () => {
+test('SSH command line quotes cwd and arguments and exports valid variables', () => {
   assert.equal(
     buildPosixCommandLine('codex', ['app-server', "a'b;$(touch bad)"], '/work/my repo', {
       REINS_TRACE: "hop'1",
       REINS_EMPTY: '',
       OTHER_SECRET: 'local-only',
     }),
-    "cd '/work/my repo' && export REINS_TRACE='hop'\"'\"'1' REINS_EMPTY='' && 'codex' 'app-server' 'a'\"'\"'b;$(touch bad)'",
+    "cd '/work/my repo' && export REINS_TRACE='hop'\"'\"'1' REINS_EMPTY='' OTHER_SECRET='local-only' && 'codex' 'app-server' 'a'\"'\"'b;$(touch bad)'",
   );
   assert.equal(buildPosixCommandLine('codex', ['--help']), "'codex' '--help'");
+  assert.equal(
+    buildPosixCommandLine('dsh', [], undefined, { PATH: '/bin', NARB_DISABLE_NATIVE_CACHE: '1' }, { closeStdin: true }),
+    "export PATH='/bin' NARB_DISABLE_NATIVE_CACHE='1' && 'dsh' < /dev/null",
+  );
   assert.throws(
     () => buildPosixCommandLine('codex', [], undefined, { 'REINS_BAD;echo': 'x' }),
     /Invalid remote environment variable name/,
@@ -190,6 +194,76 @@ test('Antigravity driver reports process failures and aborts active turns', asyn
   assert.equal(slowSnapshot.stopReason, 'aborted');
 });
 
+test('Antigravity agentapi reads transcript and preserves persistent conversations', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-agentapi-'));
+  try {
+    const logPath = path.join(home, 'calls.jsonl');
+    const driver = new AntigravityDriver({
+      driver: 'agentapi',
+      command: process.execPath,
+      args: [path.resolve('tests/fixtures/mock-agentapi.mjs')],
+      antigravityHome: home,
+      env: { MOCK_AGENTAPI_HOME: home, MOCK_AGENTAPI_LOG: logPath },
+    });
+    const snapshot = createInitialTaskSnapshot({
+      taskId: 'agy-agentapi', targetId: 'mock-agy', kind: 'antigravity',
+      sessionMode: 'persistent', reinPolicy: 'auto-edit', model: 'flash_lite', cwd: process.cwd(),
+    });
+    await driver.runTurn(snapshot, { prompt: 'First message' });
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.sessionId, 'agy_mock_123');
+    assert.equal(snapshot.output, 'AGY_TEST_OK');
+    assert.equal(snapshot.commentary, 'checked');
+    assert.deepEqual(snapshot.metrics.tokens, { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 });
+    assert.equal(snapshot.resumeCommandHint, 'agy --conversation agy_mock_123');
+    assert.ok(fs.existsSync(path.join(home, 'conversations', 'agy_mock_123.pb')));
+
+    await driver.runTurn(snapshot, { prompt: 'Second message' });
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.output, 'AGY_SECOND_OK');
+    assert.equal(snapshot.metrics.turnCount, 2);
+    const calls = fs.readFileSync(logPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+    assert.deepEqual(calls[0].slice(0, 3), ['new-conversation', '--model=flash_lite', '--title=Reins H2H Task']);
+    assert.deepEqual(calls[1].slice(0, 2), ['send-message', 'agy_mock_123']);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Antigravity agentapi removes ephemeral files and reports planner errors', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-agentapi-ephemeral-'));
+  try {
+    const config = {
+      driver: 'agentapi', command: process.execPath,
+      args: [path.resolve('tests/fixtures/mock-agentapi.mjs')],
+      antigravityHome: home,
+      env: { MOCK_AGENTAPI_HOME: home },
+    };
+    const ephemeral = createInitialTaskSnapshot({
+      taskId: 'agy-ephemeral', targetId: 'mock-agy', kind: 'antigravity',
+      sessionMode: 'ephemeral', cwd: process.cwd(),
+    });
+    await new AntigravityDriver(config).runTurn(ephemeral, { prompt: 'One shot' });
+    assert.equal(ephemeral.status, 'completed');
+    assert.equal(ephemeral.resumeCommandHint, undefined);
+    assert.ok(!fs.existsSync(path.join(home, 'brain', ephemeral.sessionId)));
+    assert.ok(!fs.existsSync(path.join(home, 'conversations', `${ephemeral.sessionId}.pb`)));
+    assert.ok(!fs.existsSync(path.join(home, 'annotations', `${ephemeral.sessionId}.pbtxt`)));
+
+    const failed = createInitialTaskSnapshot({
+      taskId: 'agy-error', targetId: 'mock-agy', kind: 'antigravity',
+      sessionMode: 'ephemeral', cwd: process.cwd(),
+    });
+    await new AntigravityDriver({
+      ...config, env: { MOCK_AGENTAPI_HOME: home, MOCK_AGENTAPI_ERROR: '1' },
+    }).runTurn(failed, { prompt: 'Fail' });
+    assert.equal(failed.status, 'failed');
+    assert.match(failed.error, /Planner failed/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('DSH ACP driver handshakes, streams updates, and selects permission', async () => {
   const driver = new DshDriver({
     driver: 'acp',
@@ -290,6 +364,41 @@ test('DSH ACP driver sends session/cancel when interrupted', async () => {
     assert.equal(snapshot.stopReason, 'aborted');
   } finally {
     await driver.abort(snapshot.taskId);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('DSH headless parses JSONL events, session flags, and errors', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-dsh-headless-'));
+  try {
+    const logPath = path.join(tempDir, 'calls.jsonl');
+    const config = {
+      driver: 'dsh-headless', command: process.execPath,
+      args: [path.resolve('tests/fixtures/mock-dsh-headless.mjs')],
+      env: { MOCK_DSH_LOG: logPath },
+    };
+    const snapshot = createInitialTaskSnapshot({
+      taskId: 'dsh-headless', targetId: 'mock-dsh', kind: 'dsh',
+      sessionId: 'dsh_previous', sessionMode: 'ephemeral', cwd: process.cwd(),
+    });
+    await new DshDriver(config).runTurn(snapshot, { prompt: 'Headless test' });
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.sessionId, 'dsh_mock_headless');
+    assert.equal(snapshot.resumeCommandHint, undefined);
+    assert.equal(snapshot.output, 'DSH_TEST_OK');
+    assert.equal(snapshot.commentary, 'checking');
+    assert.deepEqual(snapshot.metrics.tokens, { inputTokens: 7, outputTokens: 4, cacheReadTokens: 1 });
+    const args = JSON.parse(fs.readFileSync(logPath, 'utf8').trim());
+    assert.deepEqual(args.slice(-6), ['--profile', 'headless', '--json', '--session-id', 'dsh_previous', 'Headless test']);
+
+    const failed = createInitialTaskSnapshot({
+      taskId: 'dsh-headless-failed', targetId: 'mock-dsh', kind: 'dsh',
+      sessionMode: 'persistent', cwd: process.cwd(),
+    });
+    await new DshDriver({ ...config, env: { MOCK_DSH_ERROR: '1' } }).runTurn(failed, { prompt: 'Fail' });
+    assert.equal(failed.status, 'failed');
+    assert.match(failed.error, /Headless failed/);
+  } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

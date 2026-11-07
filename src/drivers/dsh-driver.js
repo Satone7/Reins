@@ -2,13 +2,28 @@
  * DeepSeek Harness driver over ACP JSON-RPC stdio or SSH.
  */
 
+import { spawn } from 'node:child_process';
+import readline from 'node:readline';
 import {
   applyPresetPrompt,
   buildResumeCommandHint,
   formatDiagnosticSummary,
 } from '../protocol/schema.js';
-import { resolveExecutable } from '../transports/local.js';
-import { createJsonRpcTransport } from '../transports/ssh.js';
+import { killProcessTree, resolveExecutable } from '../transports/local.js';
+import { buildPosixCommandLine, buildSshArgs, createJsonRpcTransport } from '../transports/ssh.js';
+
+const CREDENTIAL_LOADER = [
+  'if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -f "$HOME/.dsh/.credentials.yaml" ]; then',
+  '  DEEPSEEK_API_KEY=$(awk \'' +
+    '/^[[:space:]]*refs:[[:space:]]*$/ { in_refs=1; next } ' +
+    'in_refs && /^[^[:space:]]/ { exit } ' +
+    'in_refs && /^[[:space:]]*DEEPSEEK_API_KEY:[[:space:]]*/ ' +
+    '{ sub(/^[[:space:]]*DEEPSEEK_API_KEY:[[:space:]]*/, ""); print; exit }' +
+    '\' "$HOME/.dsh/.credentials.yaml")',
+  '  if [ -n "$DEEPSEEK_API_KEY" ]; then export DEEPSEEK_API_KEY; fi',
+  'fi',
+  'exec "$@"',
+].join('\n');
 
 function findAllowOption(options) {
   return options?.find((option) =>
@@ -28,6 +43,10 @@ export class DshDriver {
   }
 
   async runTurn(snapshot, { prompt, envVars = {}, timeoutMs = 600000 }, onUpdate = () => {}) {
+    const configuredArgs = Array.isArray(this.targetConfig.args) ? this.targetConfig.args : [];
+    if (this.targetConfig.driver === 'dsh-headless' || configuredArgs.includes('headless')) {
+      return this._runHeadless(snapshot, { prompt, envVars, timeoutMs }, onUpdate);
+    }
     const transportConfig = this.targetConfig.transport;
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
     const configuredCommand = this.targetConfig.command || 'auto';
@@ -218,9 +237,156 @@ export class DshDriver {
     return snapshot;
   }
 
+  async _runHeadless(snapshot, { prompt, envVars, timeoutMs }, onUpdate) {
+    const startTimeMs = Date.now();
+    const transportConfig = this.targetConfig.transport;
+    const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
+    const configuredCommand = this.targetConfig.command || 'auto';
+    const command = isSsh
+      ? (configuredCommand === 'auto' ? 'dsh' : configuredCommand)
+      : resolveExecutable(configuredCommand, 'dsh');
+    const framedPrompt = applyPresetPrompt(prompt, snapshot.preset);
+    const args = [...(Array.isArray(this.targetConfig.args) ? this.targetConfig.args : [])];
+    if (!args.includes('--profile')) args.push('--profile', 'headless');
+    if (!args.includes('--json')) args.push('--json');
+    if (snapshot.sessionId) args.push('--session-id', snapshot.sessionId);
+    args.push(framedPrompt);
+    const env = { ...(this.targetConfig.env || {}), ...envVars };
+    if (isSsh) env.NARB_DISABLE_NATIVE_CACHE ||= '1';
+    const remoteCommand = this.targetConfig.loadCredentialsFromDsh === false
+      ? buildPosixCommandLine(command, args, snapshot.cwd, env, { closeStdin: true })
+      : buildPosixCommandLine(
+        'sh', ['-c', CREDENTIAL_LOADER, 'reins-dsh', command, ...args],
+        snapshot.cwd, env, { closeStdin: true },
+      );
+    const spawnCommand = isSsh ? 'ssh' : command;
+    const spawnArgs = isSsh ? ['-n', ...buildSshArgs(transportConfig, remoteCommand)] : args;
+    const appendEvent = (event) => {
+      snapshot.transcript.lastSeq += 1;
+      snapshot.transcript.totalEvents += 1;
+      snapshot.transcript.messages.push({
+        seq: snapshot.transcript.lastSeq,
+        timestamp: new Date().toISOString(),
+        ...event,
+      });
+    };
+    const emitUpdate = () => {
+      snapshot.metrics.updatedAt = new Date().toISOString();
+      snapshot.metrics.durationMs = Math.max(0, Date.now() - startTimeMs);
+      snapshot.diagnostic = formatDiagnosticSummary(snapshot);
+      onUpdate(snapshot);
+    };
+    const runtime = { child: null, snapshot, emitUpdate, aborted: false };
+    this.activeSessions.set(snapshot.taskId, runtime);
+    snapshot.status = 'running';
+    snapshot.stopReason = undefined;
+    snapshot.error = undefined;
+    snapshot.output = '';
+    snapshot.metrics.turnCount = (snapshot.metrics.turnCount || 0) + 1;
+    appendEvent({ role: 'user', phase: 'input', text: framedPrompt });
+    emitUpdate();
+
+    try {
+      const result = await new Promise((resolve) => {
+        let child;
+        try {
+          child = spawn(spawnCommand, spawnArgs, {
+            cwd: isSsh ? process.cwd() : snapshot.cwd || process.cwd(),
+            env: isSsh ? process.env : { ...process.env, ...env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            detached: process.platform !== 'win32',
+            shell: !isSsh && process.platform === 'win32' && /\.(cmd|bat)$/i.test(command),
+          });
+        } catch (error) {
+          resolve({ error });
+          return;
+        }
+        runtime.child = child;
+        let stderr = '';
+        let error = null;
+        const reader = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+        reader.on('line', (line) => {
+          let event;
+          try {
+            event = JSON.parse(line);
+          } catch {
+            return;
+          }
+          if (event.type === 'session' && event.sessionId) {
+            snapshot.sessionId = event.sessionId;
+            snapshot.resumeCommandHint = buildResumeCommandHint({
+              kind: 'dsh', sessionId: snapshot.sessionId, sessionMode: snapshot.sessionMode,
+              transportType: isSsh ? 'ssh' : 'local', sshHost: transportConfig?.host || transportConfig?.sshHost,
+            });
+          } else if (event.type === 'thinking' && typeof event.text === 'string') {
+            snapshot.commentary = `${snapshot.commentary || ''}${event.text}`;
+          } else if (event.type === 'text' && typeof event.text === 'string') {
+            snapshot.output = `${snapshot.output || ''}${event.text}`;
+          } else if (event.type === 'final' && typeof event.text === 'string') {
+            snapshot.output = event.text;
+            runtime.sawFinal = true;
+          } else if (event.type === 'status' && event.phase === 'step_end' && event.usage) {
+            const usage = event.usage;
+            const previous = snapshot.metrics.tokens || {};
+            snapshot.metrics.tokens = {
+              inputTokens: (previous.inputTokens || 0) + (usage.inputTokens ?? usage.input_tokens ?? 0),
+              outputTokens: (previous.outputTokens || 0) + (usage.outputTokens ?? usage.output_tokens ?? 0),
+              cacheReadTokens: (previous.cacheReadTokens || 0) + (usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0),
+            };
+          } else if (event.type === 'status' && event.phase === 'turn_end') {
+            runtime.turnReason = event.reason;
+          }
+          emitUpdate();
+        });
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk) => { stderr += chunk; });
+        child.on('error', (caught) => { error = caught; });
+        child.on('close', (exitCode) => {
+          resolve({ exitCode, stderr, error });
+        });
+        if (timeoutMs > 0) {
+          runtime.timer = setTimeout(() => {
+            runtime.timedOut = true;
+            killProcessTree(child).catch(() => {});
+          }, timeoutMs);
+        }
+      });
+      if (runtime.aborted) {
+        snapshot.status = 'aborted';
+        snapshot.stopReason = 'aborted';
+      } else if (runtime.timedOut || result.error || result.exitCode !== 0 ||
+          runtime.turnReason?.kind === 'error') {
+        snapshot.status = 'failed';
+        snapshot.stopReason = 'error';
+        snapshot.error = runtime.timedOut
+          ? `DeepSeek Harness turn timed out after ${timeoutMs}ms.`
+          : result.error?.message || runtime.turnReason?.message || result.stderr?.trim() ||
+            `DeepSeek Harness exited with code ${result.exitCode}.`;
+      } else {
+        appendEvent({ role: 'assistant', phase: 'final_answer', text: snapshot.output });
+        snapshot.status = 'completed';
+        snapshot.stopReason = 'end_turn';
+      }
+      emitUpdate();
+      return snapshot;
+    } finally {
+      if (runtime.timer) clearTimeout(runtime.timer);
+      this.activeSessions.delete(snapshot.taskId);
+    }
+  }
+
   async steerLive(taskId, { action, message }) {
     const runtime = this.activeSessions.get(taskId);
     if (!runtime) return { handledLive: false };
+    if (runtime.child) {
+      if (action === 'interrupt') {
+        await this.abort(taskId);
+        return { handledLive: true };
+      }
+      if (action === 'reply') throw new Error('An active DSH headless turn cannot accept a live reply.');
+      return { handledLive: false };
+    }
     if (action === 'approve' || action === 'reject') {
       if (!runtime.pendingApproval) {
         throw new Error(`Task "${taskId}" has no pending permission request.`);
@@ -254,6 +420,10 @@ export class DshDriver {
     runtime.snapshot.stopReason = 'aborted';
     runtime.snapshot.attention = undefined;
     runtime.emitUpdate();
+    if (runtime.child) {
+      await killProcessTree(runtime.child);
+      return true;
+    }
     if (runtime.snapshot.sessionId) {
       try {
         runtime.transport.notify('session/cancel', { sessionId: runtime.snapshot.sessionId });

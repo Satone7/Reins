@@ -9,7 +9,7 @@ export function quotePosixShellArg(arg) {
   return `'${String(arg).replaceAll("'", `'"'"'`)}'`;
 }
 
-export function buildPosixCommandLine(command, args = [], cwd, envVars = {}) {
+export function buildPosixCommandLine(command, args = [], cwd, envVars = {}, { closeStdin = false } = {}) {
   if (!command || command === 'auto') {
     throw new Error('A remote executable command is required.');
   }
@@ -20,9 +20,8 @@ export function buildPosixCommandLine(command, args = [], cwd, envVars = {}) {
   }
 
   const exports = Object.entries(envVars)
-    .filter(([name]) => name.startsWith('REINS_'))
     .map(([name, value]) => {
-      if (!/^REINS_[A-Za-z0-9_]+$/.test(name)) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
         throw new Error(`Invalid remote environment variable name: ${name}`);
       }
       return `${name}=${quotePosixShellArg(value)}`;
@@ -31,7 +30,8 @@ export function buildPosixCommandLine(command, args = [], cwd, envVars = {}) {
     parts.push(`export ${exports.join(' ')}`);
   }
 
-  parts.push([command, ...args].map(quotePosixShellArg).join(' '));
+  const commandLine = [command, ...args].map(quotePosixShellArg).join(' ');
+  parts.push(closeStdin ? `${commandLine} < /dev/null` : commandLine);
   return parts.join(' && ');
 }
 

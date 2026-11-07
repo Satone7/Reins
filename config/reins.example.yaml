@@ -49,9 +49,10 @@ targets:
     transport:
       kind: local
     driver:
-      mode: agy-cli
-      command: agy
+      mode: agentapi
+      command: auto
       args: []
+    model: flash_lite
     workspace:
       defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
       allowedSyncModes: [remote-native, context-only]
@@ -74,7 +75,28 @@ targets:
     reinPolicy: parent-rein
     tags: [coding, automation, plugin-dev]
 
-  # 4. LAN Remote Ubuntu Node (faex1) Claude Code (Interactive Tmux + JSONL Driver)
+  # 4. LAN Remote Ubuntu Node (faex1) DeepSeek Harness (headless JSONL)
+  - id: faex1-dsh
+    label: FAEX1 Remote DeepSeek Harness
+    harnessType: dsh
+    transport:
+      kind: ssh
+      sshHost: faex1
+      connectTimeoutSec: 20
+    driver:
+      mode: dsh-headless
+      command: /home/pren/n/bin/dsh
+      args: []
+    env:
+      PATH: /home/pren/n/bin:/usr/local/bin:/usr/bin:/bin
+      NARB_DISABLE_NATIVE_CACHE: "1"
+    workspace:
+      defaultWorkdir: /home/pren/projects/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: auto-edit
+    tags: [coding, linux-shell]
+
+  # 5. LAN Remote Ubuntu Node (faex1) Claude Code (Interactive Tmux + JSONL Driver)
   - id: faex1-claude
     label: FAEX1 Remote Claude Code
     harnessType: claude-code
@@ -89,13 +111,15 @@ targets:
       paneCols: 140
       paneRows: 45
       extraArgs: []
+    env:
+      PATH: /home/pren/n/bin:/usr/local/bin:/usr/bin:/bin
     workspace:
       defaultWorkdir: /home/pren/projects/reins
       allowedSyncModes: [remote-native, git-patch, context-only]
     reinPolicy: tight-rein
     tags: [coding, refactoring, linux-shell, debugging]
 
-  # 5. Cloud Production VPS Claude Code (Connected via ProxyJump)
+  # 6. Cloud Production VPS Claude Code (Connected via ProxyJump)
   - id: vps-claude
     label: Cloud VPS Claude Code
     harnessType: claude-code

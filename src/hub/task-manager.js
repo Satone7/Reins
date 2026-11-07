@@ -77,11 +77,13 @@ export class TaskManager {
       case 'agy-cli':
       case 'antigravity-cli':
       case 'antigravity-sdk':
+      case 'agentapi':
         driver = new AntigravityDriver(target);
         break;
       case 'acp':
       case 'acp-stdio':
       case 'dsh-sdk':
+      case 'dsh-headless':
         driver = new DshDriver(target);
         break;
       case 'claude-tmux':
