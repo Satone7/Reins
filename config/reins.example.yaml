@@ -1,0 +1,100 @@
+# Reins Configuration Example (reins.yaml)
+# 定义本机与远程可调度的 AI Coding Harness 节点、控缰策略与移动端通知渠道
+
+hub:
+  host: 127.0.0.1
+  port: 19420
+  stateDir: ~/.reins
+  loopGuard:
+    maxHops: 3
+    allowSelfCall: false
+
+# 移动端推送通知配置 (Phase 2 & Mobile App 桥接)
+notifications:
+  enabled: true
+  triggers:
+    - task.attention_required   # 遇到权限弹窗或需要人工确认时立即推送
+    - task.completed            # 长任务完成时推送
+    - task.failed               # 任务异常中断时推送
+  channels:
+    - id: mobile-ntfy
+      kind: ntfy
+      server: https://ntfy.sh
+      topic: reins-agent-alerts-example
+      priority: high
+
+# 可调度的本机与远程 Harness 节点列表 (Targets)
+targets:
+  # 1. 局域网远程 Linux 节点上的 Claude Code (交互式 Tmux + JSONL 驱动)
+  - id: faex1-claude
+    label: FAEX1 Remote Claude Code
+    harnessType: claude-code
+    transport:
+      kind: ssh
+      sshHost: faex1
+      connectTimeoutSec: 20
+    driver:
+      mode: tmux-jsonl
+      binaryPath: /home/pren/n/bin/claude
+      tmuxPrefix: reins-cc
+      paneCols: 140
+      paneRows: 45
+      extraArgs: []
+    workspace:
+      defaultWorkdir: /home/pren/tmp/reins-workspace
+      allowedSyncModes: [remote-native, git-patch, context-only]
+    reinPolicy: tight-rein
+    capabilities: [coding, refactoring, linux-shell, debugging]
+
+  # 2. 云端生产 VPS 上的 Claude Code (通过 ProxyJump 连接)
+  - id: vps-claude
+    label: Cloud VPS Claude Code
+    harnessType: claude-code
+    transport:
+      kind: ssh
+      sshHost: claude-vps
+      connectTimeoutSec: 20
+    driver:
+      mode: tmux-jsonl
+      binaryPath: /home/frank/.local/bin/claude
+      tmuxPrefix: reins-cc
+      paneCols: 140
+      paneRows: 45
+      extraArgs: []
+    workspace:
+      defaultWorkdir: /home/frank/workspace
+      allowedSyncModes: [remote-native, git-patch, context-only]
+    reinPolicy: tight-rein
+    capabilities: [coding, architecture, code-review]
+
+  # 3. 本机 DeepSeek Harness (通过原生 ACP 或 Headless 驱动)
+  - id: local-dsh
+    label: Local DeepSeek Harness (DSH)
+    harnessType: dsh
+    transport:
+      kind: local
+    driver:
+      mode: acp
+      command: npx
+      args: ["@deepseek-ai/dsh", "--profile", "acp"]
+    workspace:
+      defaultWorkdir: C:/Users/ariab/Desktop/workspace
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: parent-rein
+    capabilities: [coding, automation, plugin-dev]
+
+  # 4. 本机或远端 OpenAI Codex CLI (通过 JSON 事件流驱动)
+  - id: local-codex
+    label: Local OpenAI Codex CLI
+    harnessType: codex
+    transport:
+      kind: local
+    driver:
+      mode: stream-json
+      command: codex
+      args: ["exec", "--json"]
+    workspace:
+      defaultWorkdir: C:/Users/ariab/Desktop/workspace
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: free-rein
+    capabilities: [coding, fast-implementation, boilerplate]
