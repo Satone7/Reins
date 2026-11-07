@@ -1,176 +1,358 @@
-# Reins H2H (Harness-to-Harness) Protocol Specification v0.1
+# Reins H2H (Harness-to-Harness) Protocol Specification v0.2
 
-> **状态**：Draft v0.1  
-> **定位**：定义不同 AI Coding Harness（本机或跨机远程）之间通过 **Reins Hub** 进行能力发现、任务派发、多轮协同、权限托管与移动端通知同步的标准协议模型。
-
----
-
-## 1. 核心术语与隐喻映射（Equestrian Metaphor Mapping）
-
-为了在协议层、MCP 工具层与未来的手机 App 端保持高度一致的心智模型，Reins 采用以下标准术语：
-
-| 术语 | 协议对象 / 原语 | 含义说明 |
-| :--- | :--- | :--- |
-| **Target (Harness Node)** | `HarnessCard` | 一个可被调用的目标 Harness 实例（例如：`local-dsh`、`local-codex`、`remote-faex1-claude`、`remote-vps-claude`）。 |
-| **Rein Policy（控缰策略）** | `ReinPolicy` | 权限与自主度级别：<br>• `free-rein`：全自动放行，不弹窗（适用于受控沙盒）；<br>• `parent-rein`：遇到权限请求时挂起并交由调用方（父 Harness）决定；<br>• `tight-rein`：遇到高危操作或权限请求时，挂起并推送到人类手机端审批。 |
-| **Hand Over（移交缰绳）** | `reins_delegate` | 父 Harness 将子任务派发给目标 Harness（支持同步等待或异步返回 `taskId`）。 |
-| **Steer（牵引/转向）** | `reins_steer` | 向正在运行或处于 `attention_required` 状态的任务追加指令、回复追问或作出权限审批（Allow/Deny）。 |
-| **Pull the Reins（勒停）** | `reins_abort` | 紧急中断目标 Harness 当前正在执行的回合（如向 tmux 发送 `Escape`/`Ctrl-C` 或终止子进程）。 |
+> **Status**: Draft v0.2 (Aligned with OpenAI `codex-plugin-cc` / `codex app-server`, DeepSeek Harness `@deepseek-ai/dsh-subagent*`, ACP, and `dsh-claude-vps`)  
+> **Scope**: Defines the standardized protocol for capability discovery, task delegation, multi-turn steering/resumption, interactive permission governance, and mobile notification synchronization across local and remote AI Coding Harnesses via **Reins Hub**.
 
 ---
 
-## 2. 目标能力声明：`HarnessCard`
+## 1. Design Goals & Ecosystem Compatibility Principles
 
-每个注册在 Reins 中的本机或远程 Harness 节点，对外暴露标准化的 `HarnessCard` 结构（灵感源自 A2A 的 Agent Card，但针对 Coding Harness 进行了工程化扩展）：
+Reins H2H synthesizes existing cross-harness communication patterns into a **unified, cross-platform (Windows + Ubuntu), transport-agnostic (Local + SSH) superset specification**:
+
+1. **Full Compatibility with DeepSeek Harness (`@deepseek-ai/dsh-subagent*`) Contracts**:
+   - Preserves DSH's strict separation between **`output`** (final assistant response blocks) and **`diagnostic`** (structured, credential-safe failure and permission facts), as well as the canonical `stopReason` vocabulary (`completed` | `aborted` | `error` | `max-tokens` | `refusal`).
+   - Supports both lifecycle paradigms from `tool-subagent` and `tool-subagent-control`, aligning with `subagent`, `send_message`, `interrupt_agent`, and `list_agents`.
+   - **Beyond DSH's Unattended Limitation**: Overcomes DSH's restriction where `subagent-codex` and `subagent-claude-code` only run locally in one-shot unattended mode and hard-reject every runtime approval request (`declined`/`denied`).
+2. **Dialectical Dual-Mode Session Governance (`persistent` First-Class vs. `ephemeral` One-Shot)**:
+   - Balances **human resumability** against **session list signal-to-noise ratio**:
+     - **`persistent` Mode (First-Class User Session)**: Used for substantial feature work, multi-file refactoring, deep debugging, and iterative multi-turn tasks. Sessions are persisted directly in the target Harness's **default user session store** (`~/.codex/sessions`, `~/.claude/projects`, `~/.dsh`), making them immediately visible and resumable by the human user in native clients (`codex resume`, `claude --resume`, DSH UI, or `tmux attach`).
+     - **`ephemeral` Mode (Burn-After-Reading / One-Shot Session)**: Used for granular queries, data/summary exports, single-pass code reviews, and high-frequency micro-tasks. Drivers use native ephemeral/isolated flags (`ephemeral: true` in Codex, `persistSession: false` in Claude SDK, isolated home in DSH) so micro-tasks **never dilute or clutter the user's valuable session history**.
+3. **Full Compatibility with OpenAI Codex Official Protocols (`codex-plugin-cc` / `codex app-server` / `codex mcp-server`)**:
+   - Drives local or remote Codex via **`codex app-server --stdio`** JSON-RPC 2.0 (`initialize`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and reverse `item/*/requestApproval` interception).
+   - Compatible with `codex-plugin-cc` workflow presets (`task`, `review`, `adversarial-review`, `rescue`) and session handoff (`codex resume <threadId>`).
+4. **Full Compatibility with `dsh-claude-vps` Interactive Tmux + JSONL Protocol**:
+   - Supports driving interactive Claude Code over `SSH + Tmux Bracketed Paste + JSONL Transcript Watcher + Capture-Pane Dialog Detection`, including `attachTmux` and `resumeSessionId`.
+5. **Full Compatibility with ACP (`@agentclientprotocol/sdk`)**:
+   - Supports `initialize` $\rightarrow$ `session/new` / `session/resume` / `session/list` $\rightarrow$ `session/prompt` and `session/request_permission`.
+
+---
+
+## 2. Core Terminology & Cross-Harness Mapping
+
+Reins exposes **two 100% isomorphic Northbound Surfaces**—**CLI + Agent Skill (`reins <subcommand>` + `skills/reins/SKILL.md`)** and **MCP Server (`reins-mcp`)**:
+
+| Reins Concept | MCP Tool (`reins-mcp`) | CLI Subcommand (`reins` + `SKILL.md`) | DSH Equivalent (`dsh-subagent`) | OpenAI Equivalent (`codex-plugin-cc` / `mcp`) | `dsh-claude-vps` Equivalent | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Target** | `reins_targets` | `reins targets [--json]` | `list_agents` / `providerName` | `/codex:setup` | `claude_vps_status` (targets) | Discover configured local/remote Harness targets and active/resumable sessions. |
+| **Hand Over** | `reins_delegate` | `reins delegate <target> [options]` | `subagent_<provider>` | `codex` / `task` / `review` | `claude_vps_start` + `claude_vps_send` | Delegate a task to a target Harness (foreground wait with graceful background fallback). |
+| **Inspect** | `reins_status` | `reins status [taskId] [options]` | `list_agents` / `job_output` | `status` / `result` | `claude_vps_status` + `claude_vps_read` | Query task status, incremental transcript (`sinceSeq`), pending approval dialogs, and final output. |
+| **Steer** | `reins_steer` | `reins steer <taskId> <action> [msg]` | `send_message` | `codex-reply` / Approval RPC | `claude_vps_send` / `claude_vps_key` | **Unified Control Primitive**:<br>1. When `attention_required`: approve/deny permission prompts (`approve` / `approve_session` / `deny`);<br>2. When `completed`/`idle`: send follow-up turn (`reply`);<br>3. When `working`: inject mid-turn steering instruction. |
+| **Pull the Reins** | `reins_abort` | `reins abort <taskId> [--kill]` | `interrupt_agent` / `job_kill` | `cancel` / `turn/interrupt` | `claude_vps_interrupt` / `stop` | Interrupt the active turn (keeps underlying session resumable by default unless `--kill` / `terminateSession: true` is passed). |
+
+---
+
+## 3. Target Capability Declaration: `HarnessCard`
+
+Every target registered in `reins.yaml` exposes a standardized `HarnessCard`:
 
 ```json
 {
-  "id": "faex1-claude",
-  "label": "FAEX1 Remote Claude Code",
-  "harnessType": "claude-code",
+  "id": "local-codex",
+  "label": "Local OpenAI Codex (app-server)",
+  "harnessType": "codex",
   "transport": {
-    "kind": "ssh",
-    "sshHost": "faex1",
-    "platform": "linux"
+    "kind": "local",
+    "platform": "win32"
   },
   "driver": {
-    "mode": "tmux-jsonl",
-    "binaryPath": "/home/pren/n/bin/claude",
-    "supportsResume": true,
-    "supportsInteractiveApproval": true
+    "mode": "codex-app-server",
+    "command": "auto",
+    "capabilities": {
+      "persistentSession": true,
+      "ephemeralSession": true,
+      "interactiveApproval": true,
+      "midTurnSteer": true,
+      "modelSelection": true,
+      "outputSchema": true,
+      "attachExisting": true
+    }
   },
   "workspace": {
-    "defaultWorkdir": "/home/pren/tmp/reins-workspace",
-    "syncModes": ["remote-native", "git-patch", "context-only"]
+    "defaultWorkdir": "C:/Users/ariab/Desktop/workspace/reins",
+    "allowedSyncModes": ["remote-native", "context-only"]
   },
-  "reinPolicy": "tight-rein",
-  "capabilities": ["coding", "refactoring", "code-review", "linux-shell"],
-  "status": "idle"
+  "reinPolicy": "auto-edit",
+  "tags": ["coding", "review", "adversarial-review", "rescue"],
+  "status": {
+    "availability": "online",
+    "activeTasks": 0
+  }
 }
 ```
 
-### 支持的 `driver.mode`（南向驱动模式）
-1. **`tmux-jsonl`**：通过 `tmux` 维持真实交互式 TUI 会话，并监听本地/远端 JSONL 转录文件获取结构化输出（专为禁止 `-p` 或需要完整交互特性的 Claude Code 等设计）。
-2. **`acp`**：通过 **Agent Client Protocol** (stdio JSON-RPC 2.0) 驱动（如 `dsh --profile acp` 或各类 ACP Adapter）。
-3. **`stream-json`**：通过无头 CLI 流式 JSON 模式驱动（如 `codex exec --json`、`claude -p --output-format stream-json`）。
-4. **`headless-oneshot`**：通过单次命令调用获取标准输出（如 `dsh --profile headless "<prompt>"`）。
+---
+
+## 4. `ReinPolicy` & Native Permission Mapping Matrix
+
+Reins defines **5 standard `ReinPolicy` levels** and automatically translates them into each Harness's native permission and sandbox parameters:
+
+| H2H `ReinPolicy` | Policy Semantics | **Codex (`codex-app-server`)** Mapping | **Claude Code (`claude-tmux` / `claude-sdk`)** Mapping | **ACP (`acp` / `dsh`)** Mapping | Hub Runtime Approval Behavior |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`free-rein`** | Unattended full access (for isolated sandboxes/containers) | `approvalPolicy: 'never'`,<br>`sandbox: 'danger-full-access'`<br>(or auto-reply `accept`) | `--permission-mode bypassPermissions`<br>(or auto-key `1. Yes`) | Auto-select `allow_always` / `allow_once` | **Auto-approves** without suspending the task; records approval fact in `diagnostic`. |
+| **`auto-edit`** | Autonomous workspace edits & safe commands; gates risky operations | `approvalPolicy: 'on-request'`,<br>`approvalsReviewer: 'auto_review'`,<br>`sandbox: 'workspace-write'` | `--permission-mode acceptEdits` | Auto-allow `read`/`edit`/`search`; gate others | Routine workspace operations run automatically; out-of-bounds requests transition to `attention_required`. |
+| **`parent-rein`** | Suspend on permission prompt and delegate decision to parent Harness | `approvalPolicy: 'on-request'`,<br>`sandbox: 'workspace-write'` | `--permission-mode default` | Suspend `session/request_permission` Promise | Transitions task to **`attention_required`** and returns the prompt in `H2HTaskSnapshot.attention` for parent-agent `reins_steer`. |
+| **`tight-rein`** | Suspend on permission prompt and push interactive alert to human mobile device | `approvalPolicy: 'on-request'`,<br>`sandbox: 'workspace-write'` | `--permission-mode default` | Suspend `session/request_permission` Promise | Transitions task to **`attention_required`** and fires **H2M Push (`ntfy`/Bark/App)** for human approval. |
+| **`plan-only`** | Strict read-only analysis / code review (matches `/codex:review`) | `approvalPolicy: 'never'`,<br>`sandbox: 'read-only'` | `--permission-mode plan` | Deny write/execute permissions; allow `read`/`search`/`think` | Automatically declines (`decline`/`deny`) any write or destructive command and records it in `diagnostic`. |
 
 ---
 
-## 3. H2H 任务状态机（Task Lifecycle State Machine）
+## 5. H2H Task State Machine & Result Envelope (`H2HTaskSnapshot`)
 
-为兼容 MCP `2026-07-28` 异步任务扩展（`io.modelcontextprotocol/tasks`）并支持移动端实时接管，每个 H2H 任务遵循以下状态流转：
+### 5.1 Task Lifecycle State Machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> queued: reins_delegate()
-    queued --> starting: 分配 Session / 同步 Workspace
-    starting --> working: 注入 Prompt / 进程开始执行
-    working --> attention_required: 触发权限弹窗 (1.Yes/3.No) 或 Agent 追问
-    attention_required --> working: reins_steer(approve/deny/reply)
-    working --> completed: 检测到 turn_duration / 正常退出并收回 Patch
-    working --> failed: 进程异常崩溃 / SSH 断连超时
-    working --> aborted: reins_abort() (Escape / SIGINT)
+    queued --> starting: Spawn process/SSH & validate/sync Workspace
+    starting --> working: Handshake complete & Turn Prompt submitted
+    working --> attention_required: Intercept approval request (Approval/CanUseTool/TmuxDialog/UserInput)
+    attention_required --> working: reins_steer(approve / approve_session / deny / reply)
+    working --> completed: Turn finished cleanly (stopReason = completed)
+    working --> failed: Process crash / protocol error / limit hit (stopReason = error | max-tokens | refusal)
+    working --> aborted: reins_abort() (stopReason = aborted)
     attention_required --> aborted: reins_abort()
-    completed --> working: reins_steer(followUpPrompt) [多轮续接]
+    completed --> working: reins_steer(action='reply', message='...') [Persistent continuation]
+    aborted --> working: reins_steer(action='reply', message='...') [Resume after interrupt]
 ```
 
-### 状态枚举定义
-- **`queued`**：任务已接收，正在等待目标 Harness 空闲或队列调度。
-- **`starting`**：正在唤醒本地进程或远程 SSH/Tmux 会话，并执行前置 Workspace 同步。
-- **`working`**：目标 Harness 正在思考或执行工具调用（可实时读取增量 `events` 和最新 `assistant` 消息片段）。
-- **`attention_required`** *(核心状态)*：目标 Harness 暂停，等待外部决策。细分为：
-  - `permission_prompt`：例如请求执行命令或修改敏感文件（附带弹窗原文与候选按键 `allow` / `allow_session` / `deny`）。
-  - `clarification_needed`：子 Harness 向调用方提出问题。
-- **`completed`**：当前回合圆满结束，返回最终回复文本、修改的文件列表及可选的 `gitPatch`。
-- **`failed`**：发生不可恢复错误。
-- **`aborted`**：被父 Harness 或手机端用户主动勒停（Pull the reins）。
+### 5.2 Canonical Task Snapshot Schema (`H2HTaskSnapshot`)
 
----
+Every Northbound operation (`reins_delegate`, `reins_status`, `reins_steer`, `reins_abort`) returns a deterministic, JSON-safe **`H2HTaskSnapshot`**:
 
-## 4. 跨机工作区上下文契约（Workspace Handoff Contract）
+```typescript
+export interface H2HTaskSnapshot {
+  /** Protocol version identifier */
+  readonly protocol: 'reins-h2h/v0.2';
+  /** Reins Hub globally unique task identifier */
+  readonly taskId: string;
+  /** Target node ID (e.g. 'local-codex', 'local-agy', 'local-dsh', 'faex1-claude') */
+  readonly target: string;
+  /** Short human-readable task summary */
+  readonly description?: string;
+  /** Session persistence mode ('persistent' = first-class user session; 'ephemeral' = one-shot) */
+  readonly sessionMode: 'persistent' | 'ephemeral';
+  /** Effective ReinPolicy governing this task */
+  readonly reinPolicy: 'free-rein' | 'auto-edit' | 'parent-rein' | 'tight-rein' | 'plan-only';
 
-当 Harness A（如 Windows 本机的 Antigravity）调用 Harness B（如 Linux 远端 `faex1` 上的 Claude Code）时，`reins_delegate` 支持指定以下三种 `workspaceMode`：
+  /** Underlying native Harness session metadata for human/agent handoff */
+  readonly nativeSession: {
+    readonly harnessType: 'codex' | 'antigravity' | 'dsh' | 'claude-code' | 'acp';
+    readonly driverMode: 'codex-app-server' | 'agy-cli' | 'acp' | 'dsh-sdk' | 'claude-tmux' | 'claude-sdk';
+    /** Native session ID (Codex threadId / Claude session UUID / DSH sessionId) */
+    readonly sessionId: string;
+    /** Active turn ID (e.g. Codex turnId) */
+    readonly turnId?: string;
+    /** Working directory on the target host */
+    readonly workdir: string;
+    /** Tmux session name when driven via claude-tmux */
+    readonly tmuxSession?: string;
+    /** Copy-pasteable native CLI command for a human to resume this session (when sessionMode === 'persistent') */
+    readonly resumeCommandHint?: string;
+  };
 
-### 4.1 `remote-native`（远端原生目录模式）
-- **适用场景**：项目代码本来就存放在远程服务器上，或者希望远程 Harness 在其固定沙盒目录中独立完成任务。
-- **行为**：Reins 直接在远端指定 `workdir` 启动 Harness，不进行跨机文件搬运。
+  /** Current task status */
+  readonly status:
+    | 'queued'
+    | 'starting'
+    | 'working'
+    | 'attention_required'
+    | 'completed'
+    | 'failed'
+    | 'aborted';
 
-### 4.2 `git-patch`（Git 补丁接力模式）
-- **适用场景**：本机与远端都克隆了同一个 Git 仓库，本机主 Agent 希望让远端 Subagent 在隔离分支/Worktree 中完成某个模块的开发并把代码改回本机。
-- **行为**：
-  1. **派单前（Pre-flight）**：提取本机当前 commit hash 及未提交的 `git diff`，通过 SSH 发送至远端并在独立的 `git worktree` 中对齐状态。
-  2. **执行中**：远端 Harness 在该 worktree 中自由编码、运行测试。
-  3. **完工后（Post-flight）**：自动在远端生成 `git diff` / `format-patch` 回传至本机，包含在任务结果 `artifacts.gitPatch` 中，由主 Agent 或人类在手机端审阅后 Apply。
+  /** Whether follow-up turns via reins_steer(reply) are supported */
+  readonly continuable: boolean;
+  /** True when waitSec elapsed while the task is still running in the background */
+  readonly timedOutWaiting?: boolean;
 
-### 4.3 `context-only`（纯上下文内联模式）
-- **适用场景**：架构设计咨询、疑难 Bug 会诊（Second Opinion）、独立算法编写或代码审查。
-- **行为**：将主 Agent 选定的文件内容或报错日志直接内联打包进结构化 Prompt 发送给目标 Harness，在临时隔离目录中执行，仅取回分析结论或代码片段。
+  /**
+   * Terminal or active stop reason (100% compatible with DSH SubagentStopReason, plus 'running' and 'attention-required')
+   */
+  readonly stopReason:
+    | 'running'
+    | 'attention-required'
+    | 'completed'
+    | 'aborted'
+    | 'error'
+    | 'max-tokens'
+    | 'refusal';
 
----
+  /**
+   * Final non-empty assistant output blocks (matches DSH SubagentResult.output)
+   */
+  readonly output: Array<{
+    readonly type: 'text';
+    readonly text: string;
+  }>;
 
-## 5. 调用链防环协议头（Loop & Recursion Guard）
+  /**
+   * Validated structured output when outputSchema was requested (matches DSH SubagentResult.structured)
+   */
+  readonly structured?: unknown;
 
-为了防止多 Harness 互相调用产生无限递归（如 `Antigravity -> DSH -> Claude Code -> Antigravity`），Reins 在每次派发任务时强制维护调用链元数据，并通过环境变量注入子进程/远端会话：
+  /**
+   * Structured, credential-safe failure and permission diagnostic facts (matches DSH SubagentResult.diagnostic, <= 4096 UTF-8 bytes)
+   */
+  readonly diagnostic?: string;
 
-```json
-{
-  "traceId": "tr_01j9x8k2m...",
-  "hopCount": 1,
-  "maxHops": 3,
-  "callChain": ["antigravity@local", "dsh@local"]
+  /**
+   * Present when status === 'attention_required': normalized approval or user-input request
+   */
+  readonly attention?: {
+    readonly requestId: string;
+    readonly kind: 'command_approval' | 'file_approval' | 'permission_grant' | 'user_input' | 'login_or_trust';
+    readonly title: string;
+    readonly summary: string;
+    readonly rawDetail?: string;
+    readonly options: Array<{
+      readonly action: 'approve' | 'approve_session' | 'deny' | 'reply';
+      readonly label: string;
+      readonly description?: string;
+    }>;
+  };
+
+  /**
+   * Incremental conversation & tool transcript (compatible with dsh-claude-vps sinceSeq polling)
+   */
+  readonly transcript?: {
+    readonly seq: number;
+    readonly sinceSeq: number;
+    readonly messages: Array<{
+      readonly seq: number;
+      readonly role: 'user' | 'assistant' | 'thinking' | 'tool';
+      readonly text: string;
+      readonly tool?: {
+        readonly name: string;
+        readonly status: 'running' | 'completed' | 'interrupted' | 'error';
+        readonly summary?: string;
+      };
+    }>;
+    readonly paneTail?: string[];
+  };
+
+  /**
+   * Cross-host workspace artifacts (populated when workspaceMode === 'git-patch')
+   */
+  readonly artifacts?: {
+    readonly gitPatch?: string;
+    readonly modifiedFiles?: string[];
+  };
+
+  /** Execution timestamps and duration */
+  readonly timing: {
+    readonly startedAt: string;
+    readonly updatedAt: string;
+    readonly durationMs: number;
+  };
 }
 ```
 
-- **注入环境变量**：
-  - `REINS_TRACE_ID`: 全局追踪 ID
-  - `REINS_HOP_COUNT`: 当前跳数（每次转发 `+1`）
-  - `REINS_CALL_CHAIN`: 逗号分隔的已途经节点 ID 列表
-- **拦截规则**：
-  1. 若 `hopCount >= maxHops`（默认 `3`），拒绝继续向下派发子任务；
-  2. 若目标 `targetId` 已经出现在 `callChain` 中（检测到环路），直接报错拦截（除非显式开启多轮乒乓辩论模式并设定最大轮次）。
+---
+
+## 6. Southbound Wire Drivers & Dual Session Lifecycle Contract
+
+Reins decouples the **Transport Layer (`LocalTransport` vs. `SshTransport`)** from the **Wire Driver Layer**. Every stdio-based driver can run either as a local child process or across an SSH tunnel.
+
+> [!IMPORTANT]
+> **Dual-Mode Session Lifecycle Governance (`persistent` First-Class vs. `ephemeral` One-Shot)**:
+> To balance **human take-over capability** against **session list cleanliness**, Reins supports `sessionMode: 'persistent' | 'ephemeral'` (with boolean alias `continuable: true | false`):
+> - **When to use `persistent` (First-Class User Session — default for `preset: 'task' | 'rescue'`)**:
+>   Iterative feature development, multi-file refactoring, deep debugging, multi-turn `reins steer` workflows, or tasks the human user may want to inspect and resume in their native Harness client (`codex resume`, `claude --resume`, DSH session list).
+> - **When to use `ephemeral` (Burn-After-Reading Session — default for `preset: 'review' | 'adversarial-review'` and micro-tasks)**:
+>   Data/summary exports, quick file explanations, single-pass code reviews, or high-frequency parallel subtasks that would otherwise clutter and dilute the user's primary session history.
+
+| Target Harness (Adaptation Order) | **`persistent` Mode (First-Class User Session)** Behavior & Human Handoff | **`ephemeral` Mode (Burn-After-Reading)** Behavior (Zero Session List Clutter) | Resuming an Existing Session (`sessionId`) |
+| :--- | :--- | :--- | :--- |
+| **1. OpenAI Codex**<br>(`codex-app-server`) | • `thread/start` sends **`ephemeral: false`**<br>• Saved to `~/.codex/sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl`<br>• Human can run `codex resume <threadId>` or view in Codex UI | • `thread/start` sends **`ephemeral: true`** (matches DSH `subagent-codex`)<br>• In-memory only; torn down on turn completion without writing to `~/.codex/sessions/` | Pass `sessionId: "<threadId>"` (invokes JSON-RPC `thread/resume` `{ threadId }`). |
+| **2. Antigravity**<br>(`agy-cli`) | • Uses default user workspace/conversation store; exposes conversation ID for UI/CLI continuation | • Runs in temporary scratch conversation context and cleans up on completion | Pass `sessionId: "<conversationId>"`. |
+| **3. DeepSeek Harness**<br>(`acp` / `dsh-sdk`) | • Uses user's primary `~/.dsh` store<br>• Top-level session (`origin !== 'subagent'`) with `sessions.flush()`<br>• Directly visible in DSH TUI / Web UI session list | • Uses isolated `~/.reins/ephemeral-dsh-home` (matches DSH `subagent-dsh-sdk`) so the user's primary `~/.dsh` list stays clean | Pass `sessionId: "<sessionId>"` (invokes ACP `session/resume` `{ sessionId, cwd }`). |
+| **4. Claude Code**<br>(`claude-tmux` / `claude-sdk`) | • Saved to `~/.claude/projects/<slug>/<uuid>.jsonl`<br>• `claude-sdk` sends **`persistSession: true`**<br>• Human can run `claude --resume <uuid>`, `/resume`, or `tmux attach -t =<tmuxSession>` | • `claude-sdk` sends **`persistSession: false`** (matches DSH `subagent-claude-code`)<br>• `claude-tmux` kills the temporary tmux session and archives/removes the scratch `.jsonl` | Pass `sessionId: "<uuid>"` (`claude --resume <uuid>`) or `attachTmux: "<name>"`. |
 
 ---
 
-## 6. 北向 MCP 工具集定义（MCP Tools Surface）
+## 7. Call-Chain Loop Guard & Workspace Handoff Contract
 
-Reins MCP Server 向宿主暴露以下 5 个精简、正交的工具：
+### 7.1 Call-Chain Loop Guard (`REINS_*` Environment Headers)
+When spawning local subprocesses or remote SSH commands, Reins injects:
+- `REINS_TRACE_ID`: Global trace identifier (e.g., `tr_01j9x8k2m`)
+- `REINS_HOP_COUNT`: Current delegation depth (root call is `1`, incremented by `+1` on each hop)
+- `REINS_MAX_HOPS`: Maximum allowed hop count (default `3`)
+- `REINS_CALL_CHAIN`: Comma-delimited list of visited target IDs (e.g., `antigravity@local,local-codex`)
 
-| MCP 工具名 | 核心参数 | 说明 |
-| :--- | :--- | :--- |
-| **`reins_targets`** | `filterCapability?`, `includeStatus?` | 列出所有已配置的本机与远程 Harness 节点、当前忙闲状态及支持的能力标签。 |
-| **`reins_delegate`** | `target`, `prompt`, `workdir?`, `workspaceMode?`, `sessionId?`, `waitSec?`, `reinPolicy?` | **核心派单工具**。支持指定 `waitSec`（例如等待 30 秒，若未完成则自动转为后台运行并返回 `taskId` 供后续查询，完美避免 MCP 超时）。 |
-| **`reins_status`** | `taskId`, `includeTranscriptTail?` | 查询指定任务或会话的当前状态（`working` / `attention_required` / `completed`）、最新进展摘要及待审批弹窗内容。 |
-| **`reins_steer`** | `taskId`, `action` (`reply` \| `approve` \| `ApproveSession` \| `deny`), `message?` | 对处于 `attention_required` 的任务作出审批决策，或向已完成/运行中的会话发送追问与修正指令。 |
-| **`reins_abort`** | `taskId` | 紧急中断目标任务（勒住缰绳），释放占用的 Harness 会话。 |
+**Enforcement Rules**:
+1. If `REINS_HOP_COUNT >= REINS_MAX_HOPS`, `reins_delegate` rejects immediately with `stopReason: 'error'` and diagnostic category `depth-limit`.
+2. If `target` is already present in `REINS_CALL_CHAIN` and `allowLoopback: true` is not explicitly set, `reins_delegate` blocks the cyclic call.
+
+### 7.2 Cross-Host Workspace Modes (`workspaceMode`)
+1. **`remote-native` (Default)**: Executes directly inside `workdir` on the target host.
+2. **`git-patch`**: Synchronizes the caller's base commit and uncommitted `git diff` into an isolated remote worktree before execution, and captures the resulting `git diff` into `H2HTaskSnapshot.artifacts.gitPatch` upon completion.
+3. **`context-only`**: Packs inline context/diffs into the prompt and defaults to `reinPolicy: 'plan-only'` for read-only reviews and consultations.
 
 ---
 
-## 7. 移动端通知与管控事件标准（H2M Event Schema）
+## 8. Dual Northbound Surface Specification: CLI + `SKILL.md` & MCP Server
 
-当任务状态发生变化（尤其是进入 `attention_required`、`completed`、`failed`）时，`reins-hub` 产生标准化的事件负载，同时推送给通知渠道（ntfy / Bark / Webhook）与未来的 **Reins App**：
+Reins provides two 100% isomorphic Northbound entry points backed by the same `reins-hub` engine:
 
-```json
-{
-  "eventId": "evt_9921a",
-  "timestamp": "2026-11-06T21:18:00Z",
-  "eventType": "task.attention_required",
-  "task": {
-    "taskId": "tsk_7f8a9",
-    "caller": "antigravity@local",
-    "target": "faex1-claude",
-    "title": "重构音频流解码模块并补充单元测试",
-    "status": "attention_required"
-  },
-  "attention": {
-    "kind": "permission_prompt",
-    "summary": "Claude Code (faex1) 请求执行 Shell 命令: rm -rf ./build && cmake -B build",
-    "rawPaneTail": "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for this session\n  3. No",
-    "actions": [
-      { "id": "approve", "label": "✅ 允许本次 (Yes)", "style": "primary" },
-      { "id": "approve_session", "label": "⏩ 本会话不再询问", "style": "secondary" },
-      { "id": "deny", "label": "🛑 拒绝 (No)", "style": "danger" }
-    ]
-  }
-}
-```
+### 8.1 The Five Core Primitives: MCP Tools vs. CLI Subcommands
+
+#### ① `reins_targets` / `reins targets`
+Lists configured local/remote Harness targets, capabilities, and active/resumable tasks.
+
+| Semantic | MCP Parameter (`reins_targets`) | CLI Option (`reins targets`) | Description |
+| :--- | :--- | :--- | :--- |
+| Filter by tag | `filterTag?: string` | `--tag <tag>` | Filter targets by capability tag (e.g. `coding`, `review`). |
+| Include sessions | `includeSessions?: boolean` (default `true`) | `--no-sessions` | Whether to include active and resumable tasks. |
+| Output format | *(Structured JSON + rendered text)* | `--json` | Outputs strict JSON when `--json` is set; compact table otherwise. |
+
+#### ② `reins_delegate` / `reins delegate`
+Delegates a task to a target Harness or resumes an existing session.
+
+| Semantic | MCP Parameter (`reins_delegate`) | CLI Option (`reins delegate <target>`) | Description |
+| :--- | :--- | :--- | :--- |
+| Target ID | `target: string` **(required)** | `<target>` **(positional 1)** | Target node ID (e.g. `local-codex`, `local-agy`, `local-dsh`, `faex1-claude`). |
+| Task prompt | `prompt: string` **(required)** | `-p, --prompt <text>` or<br>`-f, --prompt-file <path>` or<br>`--prompt-stdin` | Full instructions for the target Harness. **CLI supports file and `stdin` input to avoid PowerShell/Bash quoting pitfalls.** |
+| Short title | `description?: string` | `-d, --desc <text>` | 3–8 word task title (compatible with DSH `description`). |
+| Workflow preset | `preset?: 'task' \| 'review' \| 'adversarial-review' \| 'rescue'` | `--preset <name>` | `task`/`rescue` default to `persistent`; `review`/`adversarial-review` default to `ephemeral` + `plan-only` policy. |
+| Session mode | `sessionMode?: 'persistent' \| 'ephemeral'`<br>*(alias `continuable?: boolean`)* | `--persistent` or `--ephemeral` (`--one-shot`) | `persistent`: saved in user's native Harness session list for multi-turn/human resume. `ephemeral`: one-shot execution without session list clutter. |
+| Working dir | `workdir?: string` | `-C, --workdir <path>` | Override target working directory. |
+| Workspace mode | `workspaceMode?: 'remote-native' \| 'git-patch' \| 'context-only'` | `--workspace-mode <mode>` | Default `remote-native`. |
+| Rein policy | `reinPolicy?: 'free-rein' \| 'auto-edit' \| 'parent-rein' \| 'tight-rein' \| 'plan-only'` | `--policy <policy>` | Override target's default `ReinPolicy`. |
+| Model override | `model?: string` | `-m, --model <id>` | Optional model override. |
+| Reasoning effort | `reasoningEffort?: 'low' \| 'medium' \| 'high' \| 'max'` | `--effort <level>` | Optional reasoning effort override. |
+| Resume session | `sessionId?: string` | `-s, --session <id>` | Resume an existing native session ID (`threadId` / `uuid`). |
+| Attach tmux | `attachTmux?: string` | `--attach-tmux <name>` | Attach to an existing remote tmux session (`claude-tmux` only). |
+| Run in background | `runInBackground?: boolean` (default `false`) | `-b, --bg` | Return `taskId` immediately after submission. |
+| Foreground wait | `waitSec?: number` (default `60`) | `-w, --wait <sec>` | Max foreground wait seconds. **If exceeded, transitions smoothly to background and returns `H2HTaskSnapshot` with `timedOutWaiting: true` instead of failing.** |
+| JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |
+
+#### ③ `reins_status` / `reins status`
+Queries the latest `H2HTaskSnapshot`, incremental transcript messages, and pending approval prompts.
+
+| Semantic | MCP Parameter (`reins_status`) | CLI Option (`reins status [taskId]`) | Description |
+| :--- | :--- | :--- | :--- |
+| Task ID | `taskId?: string` | `[taskId]` or `--all` | Target task ID, or list all tasks when omitted/`--all`. |
+| Long-poll wait | `waitSec?: number` (default `0`) | `-w, --wait <sec>` | Wait up to `waitSec` seconds until the task settles or enters `attention_required`. |
+| Message cursor | `sinceSeq?: number` | `--since-seq <n>` | Return only transcript messages with `seq > sinceSeq`. |
+| Pane tail | `includePaneTail?: boolean` (default `false`) | `--pane` | Include raw terminal pane lines (`paneTail`). |
+| JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |
+
+#### ④ `reins_steer` / `reins steer`
+Approves/denies an `attention_required` permission request, sends a follow-up turn to a `persistent` session, or steers an active turn.
+
+| Semantic | MCP Parameter (`reins_steer`) | CLI Option (`reins steer <taskId> <action>`) | Description |
+| :--- | :--- | :--- | :--- |
+| Task ID | `taskId: string` **(required)** | `<taskId>` **(positional 1)** | Target task ID. |
+| Action | `action: 'reply' \| 'approve' \| 'approve_session' \| 'deny'` **(required)** | `<action>` **(positional 2)** | `approve` (allow once), `approve_session` (allow for session), `deny` (reject), or `reply` (follow-up prompt / steer). |
+| Message text | `message?: string` | `-m, --message <text>` or<br>`-f, --message-file <path>` or<br>`--message-stdin` | Required when `action === 'reply'`; optional reason when `action === 'deny'`. |
+| Foreground wait | `waitSec?: number` (default `60`) | `-w, --wait <sec>` / `-b, --bg` | Wait up to `waitSec` seconds for the steered turn to progress. |
+| JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |
+
+#### ⑤ `reins_abort` / `reins abort`
+Interrupts the active turn or terminates the underlying session.
+
+| Semantic | MCP Parameter (`reins_abort`) | CLI Option (`reins abort <taskId>`) | Description |
+| :--- | :--- | :--- | :--- |
+| Task ID | `taskId: string` **(required)** | `<taskId>` **(positional 1)** | Target task ID. |
+| Kill session | `terminateSession?: boolean` (default `false`) | `--kill` | Default `false` interrupts only the current turn while keeping the session resumable; `--kill` / `true` terminates the underlying process/tmux session. |
+| JSON output | *(Structured object)* | `--json` | Emit `H2HTaskSnapshot` JSON. |

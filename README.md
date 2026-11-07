@@ -1,71 +1,81 @@
 # Reins
 
 > **Take the reins of all your local and remote AI coding harnesses.**  
-> 跨本机与远程环境的 AI Coding Harness 互调网关（H2H MCP Server）与移动端统一指挥中心。
+> Cross-host AI Coding Harness Interop Gateway (H2H Protocol via MCP & CLI/Skill) and Mobile Command Center.
 
 ---
 
-## 1. 为什么叫 Reins？
+## 1. Why "Reins"?
 
-在 AI 编程领域，Claude Code、Codex、DeepSeek Harness (`dsh`)、Antigravity (`agy`) 等工具都被称为 **Harness（马具/挽具）**。  
-然而，当多匹穿戴着不同 Harness 的骏马一起拉车时，如果缺乏车夫手中的**总缰绳（Reins）**，它们只能各自为战、互不相通。
+In AI software engineering, tools such as OpenAI Codex, Antigravity (`agy`), DeepSeek Harness (`dsh`), and Claude Code are known as **Harnesses**.  
+However, when multiple horses wearing different harnesses pull the same carriage without unified **reins** in the driver's hands, they operate in isolated silos and cannot collaborate.
 
-**Reins** 就是这套总控系统：
-- **Pass / Hand over the reins（移交缰绳）**：让任意 Harness（如本机的 Antigravity）通过标准 MCP 协议，把子任务动态指派给另一个本机或远程的 Harness（如本机的 `dsh`/`codex`，或远程服务器上的 `claudecode`）。
-- **Take the reins（接管缰绳）**：通过手机端 App 随时随地查看各个 Harness 的实时工作进度、对话流与代码改动，必要时直接介入下达指令。
-- **Free rein vs. Tight rein（放开缰绳 / 收紧缰绳）**：灵活配置全自动沙盒执行（`free-rein`），或将高危工具调用/权限弹窗实时拦截并推送到手机端审批（`tight-rein`）。
-- **Pull the reins（勒住缰绳）**：当某个后台或远程 Harness 跑偏、陷入死循环时，在主 Agent 或手机 App 上一键中断（Abort/Escape）。
-
----
-
-## 2. 核心目标与演进路线
-
-### Phase 1: H2H (Harness-to-Harness) MCP 互调核心
-- 向上暴露标准 **MCP Server**（支持同步调用与异步任务轮询/通知），任何支持 MCP 的宿主（Antigravity、Claude Code、DSH、Codex、Cursor 等）挂载后即可获得跨 Harness 派单能力。
-- 向下抽象统一的 **`HarnessDriver`** 与 **`Transport`（Local / SSH）**：
-  - 支持本机进程直接拉起（通过 ACP 协议、JSON Stream 或 Headless CLI）。
-  - 支持通过 **SSH + Tmux / 远程通道** 调用本机未安装的远程 Harness（如在 Windows 本机通过 Antigravity 指派远端 Linux VPS 上的 Claude Code 干活）。
-
-### Phase 2: 守护进程化（`reins-hub`）与即时推送通知
-- 将状态收敛至本地/云端常驻守护进程 **`reins-hub`**，持久化管理跨 Harness 的调用树（Call Tree）、会话状态与日志流。
-- 内置通知网关（`reins-notify`），支持在任务完成、报错或遇到权限弹窗（`attention_required`）时，通过 **ntfy.sh / Bark / 飞书 / Webhook** 向手机发送交互式通知（可直接点击 Allow / Deny）。
-
-### Phase 3: Reins Mobile App（移动端指挥台）
-- 基于 `reins-hub` 暴露的实时状态流（借鉴 AHP 多端状态同步模型 + 端到端加密 Relay / Tailscale 直连），构建跨平台手机端 App：
-  - 全局看板：统一管理本机与多台远程服务器上的所有 Harness 会话。
-  - 交互审批：远程处理权限弹窗、追加 Prompt、查看 Git Diff。
-  - 主动发起：在手机上直接唤醒任意机器上的指定 Harness 启动新任务。
+**Reins** is the unified control plane that connects them:
+- **Pass / Hand over the reins**: Let any host Harness (e.g., Antigravity or Claude Code) dynamically delegate subtasks to another local or remote Harness (e.g., local `codex`, `dsh`, or remote `claude-code` over SSH) via the standardized **H2H (Harness-to-Harness) Protocol** exposed through both **MCP** and **CLI + Agent Skill (`SKILL.md`)**.
+- **Take the reins**: Inspect live progress, transcripts, and diffs from your terminal or mobile device at any time, and seamlessly resume H2H-created sessions directly inside each target Harness's native UI/CLI.
+- **Free rein vs. Tight rein**: Configure sandboxed autonomous execution (`free-rein`, `auto-edit`), route permission prompts back to the parent Harness (`parent-rein`), or intercept high-risk actions and push interactive approval cards to your mobile phone (`tight-rein`).
+- **Pull the reins**: Instantly interrupt a runaway turn (`reins abort`) while keeping the underlying session alive for follow-up steering.
 
 ---
 
-## 3. 目录结构
+## 2. Core Objectives & Evolution Roadmap
+
+### Phase 1: H2H (Harness-to-Harness) Dual-Surface Core (CLI/Skill + MCP)
+- **Dual Isomorphic Northbound Surfaces** sharing the same `reins-hub` state pool and `H2HTaskSnapshot` JSON envelope:
+  1. **CLI + Agent Skill (`reins` CLI + `skills/reins/SKILL.md`)**: Zero persistent context overhead via progressive skill disclosure; provides `reins targets|delegate|status|steer|abort|hub` commands for both AI agents and human developers.
+  2. **MCP Server (`reins-mcp`)**: Exposes `reins_targets`, `reins_delegate`, `reins_status`, `reins_steer`, and `reins_abort` over standard JSON-RPC MCP.
+- **Unified Southbound `HarnessDriver` & `Transport` (`Local` / `SSH`)**:
+  - **Adaptation Priority Order**:
+    1. **OpenAI Codex (`codex`)** — via official `codex app-server --stdio` JSON-RPC 2.0 (supporting both `persistent` first-class sessions and `ephemeral` one-shot sessions, plus interactive approval interception).
+    2. **Antigravity (`antigravity`)** — via local/remote CLI & headless/ACP integration.
+    3. **DeepSeek Harness (`dsh`)** — via native `acp` (`dsh --profile acp`) and `dsh-sdk` (`dsh --profile sdk`).
+    4. **Claude Code (`claudecode`)** — via interactive `SSH + Tmux + JSONL` (`claude-tmux`) and `claude-sdk`.
+
+### Phase 2: Daemonization (`reins-hub`) & Instant Mobile Push Notifications
+- Persist cross-harness call trees, session state, and transcript streams in the resident **`reins-hub`** daemon.
+- Built-in notification gateway (`reins-notify`) that pushes interactive notifications (`ntfy.sh` / `Bark` / Feishu / Webhook) on `task.attention_required`, `task.completed`, or `task.failed`, allowing one-tap remote Allow/Deny from a phone lock screen.
+
+### Phase 3: Reins Mobile App
+- Cross-platform mobile command center powered by `reins-hub` real-time state streams:
+  - Global multi-host session dashboard and call-tree viewer;
+  - Remote permission approval, multi-turn steering, and syntax-highlighted Git Diff review;
+  - Direct task launch on any local or remote machine from your phone.
+
+---
+
+## 3. Repository Structure
 
 ```text
 reins/
-├── README.md                         # 项目总览与愿景定义
-├── package.json                      # Node.js (ESM) 项目清单
+├── README.md                         # Project overview and vision
+├── package.json                      # Node.js (ESM) package manifest
 ├── config/
-│   └── reins.example.yaml            # 本机与远程 Harness 节点配置示例
+│   └── reins.example.yaml            # Example configuration for local & remote harness targets
+├── skills/
+│   └── reins/
+│       └── SKILL.md                  # Standard H2H CLI Agent Skill definition
 ├── research/
-│   └── PROTOCOLS_AND_ECOSYSTEM.md    # 现有协议 (MCP/A2A/ACP/AHP) 与开源生态深度调研及 H2H 定位
+│   └── PROTOCOLS_AND_ECOSYSTEM.md    # Deep dive into MCP/A2A/ACP/AHP, Codex plugin, and DSH subagents
 ├── docs/
-│   ├── ARCHITECTURE.md               # Reins 整体系统架构设计 (Hub + MCP + Drivers + Mobile)
-│   └── H2H_PROTOCOL.md               # Reins H2H (Harness-to-Harness) 互调协议规范 v0.1
+│   ├── ARCHITECTURE.md               # System architecture and phased implementation roadmap
+│   └── H2H_PROTOCOL.md               # Reins H2H (Harness-to-Harness) Protocol Specification v0.2
 └── src/
-    ├── index.js                      # 入口引导文件
-    ├── hub/                          # 核心状态机、任务路由与防环控制 (待实现)
-    ├── mcp/                          # 面向宿主 Harness 的 MCP Server 暴露层 (待实现)
-    ├── drivers/                      # 各大 Harness 驱动适配器 (Claude/Codex/DSH/AGY) (待实现)
-    ├── transports/                   # Local 子进程与 Remote SSH/Tmux 传输层 (待实现)
-    └── notify/                       # 手机端推送与 Webhook 通知桥接 (待实现)
+    ├── index.js                      # Main entry point (CLI & SDK exports)
+    ├── protocol/                     # H2H protocol types, envelopes, and validators
+    ├── cli/                          # Northbound Surface 1: `reins` CLI commands
+    ├── mcp/                          # Northbound Surface 2: `reins-mcp` stdio/HTTP MCP server
+    ├── hub/                          # Core state machine, registry, task router, and loop guard
+    ├── drivers/                      # Southbound Harness drivers (Codex, Antigravity, DSH, Claude)
+    ├── transports/                   # Cross-platform Local subprocess and Remote SSH transports
+    └── notify/                       # Mobile push notification and webhook bridges
 ```
 
 ---
 
-## 4. 快速导航（供新会话 Agent 阅读）
+## 4. Quick Navigation (For Coding Agents)
 
-在新会话中推进本项目时，请按以下顺序阅读核心文档：
-1. **[`research/PROTOCOLS_AND_ECOSYSTEM.md`](./research/PROTOCOLS_AND_ECOSYSTEM.md)**：了解当前业界协议（MCP Tasks、A2A、ACP、AHP）的边界、开源竞品优缺点，以及为什么我们需要定义轻量级的 **H2H (Harness-to-Harness)** 规范。
-2. **[`docs/H2H_PROTOCOL.md`](./docs/H2H_PROTOCOL.md)**：查看 Reins 定义的 H2H 核心原语、任务状态机、跨机 Workspace 同步契约与防死循环（Loop Guard）机制。
-3. **[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**：查看系统模块划分、已有技术资产复用方案（如复用 `../dsh-claude-vps` 中已验证的 SSH + Tmux + JSONL 交互式驱动协议）及 MVP 实施计划。
-4. **[`config/reins.example.yaml`](./config/reins.example.yaml)**：查看目标节点（Target）与策略（Rein Policy）的配置格式。
+When working on this repository in a new session, read the core documents in the following order:
+1. **[`research/PROTOCOLS_AND_ECOSYSTEM.md`](./research/PROTOCOLS_AND_ECOSYSTEM.md)**: Understand the boundaries of existing protocols (MCP Tasks, A2A, ACP, AHP), how OpenAI's `codex-plugin-cc` and DSH's `@deepseek-ai/dsh-subagent*` work under the hood, and how Reins bridges their gaps.
+2. **[`docs/H2H_PROTOCOL.md`](./docs/H2H_PROTOCOL.md)**: Review the H2H v0.2 primitives, dual session lifecycle (`persistent` vs. `ephemeral`), `ReinPolicy` permission matrix, workspace handoff contracts, loop guard headers, and isomorphic MCP/CLI schemas.
+3. **[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**: Review the module boundaries and the adaptation sequence (`codex` $\rightarrow$ `antigravity` $\rightarrow$ `dsh` $\rightarrow$ `claudecode`).
+4. **[`config/reins.example.yaml`](./config/reins.example.yaml)**: Check target and policy configuration formats.

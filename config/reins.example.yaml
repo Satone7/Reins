@@ -1,5 +1,6 @@
 # Reins Configuration Example (reins.yaml)
-# 定义本机与远程可调度的 AI Coding Harness 节点、控缰策略与移动端通知渠道
+# Defines local and remote AI Coding Harness targets, ReinPolicies, and mobile notification channels.
+# See protocol specification: docs/H2H_PROTOCOL.md (v0.2)
 
 hub:
   host: 127.0.0.1
@@ -9,13 +10,13 @@ hub:
     maxHops: 3
     allowSelfCall: false
 
-# 移动端推送通知配置 (Phase 2 & Mobile App 桥接)
+# Mobile Push Notification Configuration (Phase 2 & Mobile App Bridge)
 notifications:
   enabled: true
   triggers:
-    - task.attention_required   # 遇到权限弹窗或需要人工确认时立即推送
-    - task.completed            # 长任务完成时推送
-    - task.failed               # 任务异常中断时推送
+    - task.attention_required   # Push immediately on permission prompts or clarification requests
+    - task.completed            # Push when a long-running task finishes
+    - task.failed               # Push when a task terminates abnormally
   channels:
     - id: mobile-ntfy
       kind: ntfy
@@ -23,9 +24,57 @@ notifications:
       topic: reins-agent-alerts-example
       priority: high
 
-# 可调度的本机与远程 Harness 节点列表 (Targets)
+# Schedulable Local and Remote Harness Targets (Adaptation Order: codex -> antigravity -> dsh -> claudecode)
 targets:
-  # 1. 局域网远程 Linux 节点上的 Claude Code (交互式 Tmux + JSONL 驱动)
+  # 1. Local OpenAI Codex (Driven via official `codex app-server --stdio` JSON-RPC 2.0 protocol)
+  - id: local-codex
+    label: Local OpenAI Codex (app-server)
+    harnessType: codex
+    transport:
+      kind: local
+    driver:
+      mode: codex-app-server
+      command: auto   # Resolves `codex` on PATH or Windows Store Appx `app/resources/codex.exe`
+      args: ["app-server", "--stdio"]
+    workspace:
+      defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: auto-edit
+    tags: [coding, review, adversarial-review, rescue]
+
+  # 2. Local Antigravity (AGY)
+  - id: local-agy
+    label: Local Antigravity (AGY)
+    harnessType: antigravity
+    transport:
+      kind: local
+    driver:
+      mode: agy-cli
+      command: agy
+      args: []
+    workspace:
+      defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: parent-rein
+    tags: [coding, planning, orchestration]
+
+  # 3. Local DeepSeek Harness (Driven via ACP or DSH SDK protocol)
+  - id: local-dsh
+    label: Local DeepSeek Harness (ACP)
+    harnessType: dsh
+    transport:
+      kind: local
+    driver:
+      mode: acp
+      command: npx
+      args: ["@deepseek-ai/dsh", "--profile", "acp"]
+    workspace:
+      defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: parent-rein
+    tags: [coding, automation, plugin-dev]
+
+  # 4. LAN Remote Ubuntu Node (faex1) Claude Code (Interactive Tmux + JSONL Driver)
   - id: faex1-claude
     label: FAEX1 Remote Claude Code
     harnessType: claude-code
@@ -34,19 +83,19 @@ targets:
       sshHost: faex1
       connectTimeoutSec: 20
     driver:
-      mode: tmux-jsonl
+      mode: claude-tmux
       binaryPath: /home/pren/n/bin/claude
       tmuxPrefix: reins-cc
       paneCols: 140
       paneRows: 45
       extraArgs: []
     workspace:
-      defaultWorkdir: /home/pren/tmp/reins-workspace
+      defaultWorkdir: /home/pren/projects/reins
       allowedSyncModes: [remote-native, git-patch, context-only]
     reinPolicy: tight-rein
-    capabilities: [coding, refactoring, linux-shell, debugging]
+    tags: [coding, refactoring, linux-shell, debugging]
 
-  # 2. 云端生产 VPS 上的 Claude Code (通过 ProxyJump 连接)
+  # 5. Cloud Production VPS Claude Code (Connected via ProxyJump)
   - id: vps-claude
     label: Cloud VPS Claude Code
     harnessType: claude-code
@@ -55,7 +104,7 @@ targets:
       sshHost: claude-vps
       connectTimeoutSec: 20
     driver:
-      mode: tmux-jsonl
+      mode: claude-tmux
       binaryPath: /home/frank/.local/bin/claude
       tmuxPrefix: reins-cc
       paneCols: 140
@@ -65,36 +114,4 @@ targets:
       defaultWorkdir: /home/frank/workspace
       allowedSyncModes: [remote-native, git-patch, context-only]
     reinPolicy: tight-rein
-    capabilities: [coding, architecture, code-review]
-
-  # 3. 本机 DeepSeek Harness (通过原生 ACP 或 Headless 驱动)
-  - id: local-dsh
-    label: Local DeepSeek Harness (DSH)
-    harnessType: dsh
-    transport:
-      kind: local
-    driver:
-      mode: acp
-      command: npx
-      args: ["@deepseek-ai/dsh", "--profile", "acp"]
-    workspace:
-      defaultWorkdir: C:/Users/ariab/Desktop/workspace
-      allowedSyncModes: [remote-native, context-only]
-    reinPolicy: parent-rein
-    capabilities: [coding, automation, plugin-dev]
-
-  # 4. 本机或远端 OpenAI Codex CLI (通过 JSON 事件流驱动)
-  - id: local-codex
-    label: Local OpenAI Codex CLI
-    harnessType: codex
-    transport:
-      kind: local
-    driver:
-      mode: stream-json
-      command: codex
-      args: ["exec", "--json"]
-    workspace:
-      defaultWorkdir: C:/Users/ariab/Desktop/workspace
-      allowedSyncModes: [remote-native, context-only]
-    reinPolicy: free-rein
-    capabilities: [coding, fast-implementation, boilerplate]
+    tags: [coding, architecture, code-review]
