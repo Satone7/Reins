@@ -18,7 +18,13 @@ export { TargetRegistry, loadConfig, parseSimpleYaml } from './hub/registry.js';
 export { TaskManager } from './hub/task-manager.js';
 export { ReinsHubServer } from './hub/server.js';
 export { ReinsMcpServer, MCP_TOOLS } from './mcp/index.js';
-export { CodexAppServerDriver } from './drivers/codex-app-server.js';
+export {
+  CodexAppServerDriver,
+  deriveCodexThreadTitle,
+  normalizeCodexPath,
+  notifyCodexDesktopIpc,
+  syncCodexDesktopCatalog,
+} from './drivers/codex-app-server.js';
 export { AntigravityDriver } from './drivers/antigravity-driver.js';
 export { DshDriver } from './drivers/dsh-driver.js';
 export { ClaudeCodeDriver } from './drivers/claude-code-driver.js';

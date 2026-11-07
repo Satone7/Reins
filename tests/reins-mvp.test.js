@@ -22,6 +22,12 @@ import { ReinsMcpServer } from '../src/mcp/index.js';
 import { AntigravityDriver } from '../src/drivers/antigravity-driver.js';
 import { DshDriver } from '../src/drivers/dsh-driver.js';
 import { ClaudeCodeDriver } from '../src/drivers/claude-code-driver.js';
+import {
+  deriveCodexThreadTitle,
+  normalizeCodexPath,
+  syncCodexDesktopCatalog,
+} from '../src/drivers/codex-app-server.js';
+import { DatabaseSync } from 'node:sqlite';
 import { JsonRpcStdioTransport } from '../src/transports/local.js';
 import {
   buildPosixCommandLine,
@@ -847,5 +853,154 @@ test('TaskManager & ReinsMcpServer: end-to-end lifecycle with mock driver', asyn
       else process.env[key] = inheritedTrace[key];
     }
     fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
+});
+
+test('Codex Desktop catalog sync normalizes Windows extended paths and registers persistent threads', async () => {
+  assert.equal(
+    normalizeCodexPath('\\\\?\\C:\\Users\\ariab\\Desktop\\workspace\\reins'),
+    'C:\\Users\\ariab\\Desktop\\workspace\\reins',
+  );
+  assert.equal(
+    deriveCodexThreadTitle('[Reins H2H Preset: coding]\n# Implement Antigravity Driver\nDetails'),
+    '[Reins] Implement Antigravity Driver',
+  );
+
+  const tempCodexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-codex-home-'));
+  try {
+    const stateDbPath = path.join(tempCodexHome, 'state_5.sqlite');
+    const sqliteDir = path.join(tempCodexHome, 'sqlite');
+    fs.mkdirSync(sqliteDir, { recursive: true });
+    const catalogDbPath = path.join(sqliteDir, 'codex.db');
+    const rolloutPath = path.join(tempCodexHome, 'rollout-test.jsonl');
+    fs.writeFileSync(
+      rolloutPath,
+      '{"type":"session_meta","payload":{"id":"thr_sync_1","originator":"reins"}}\n',
+      'utf8',
+    );
+
+    const stateDb = new DatabaseSync(stateDbPath);
+    stateDb.exec(`
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        position INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE project_roots (
+        project_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        PRIMARY KEY (project_id, position)
+      );
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        model_provider TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        title TEXT,
+        name TEXT,
+        git_branch TEXT,
+        thread_source TEXT,
+        originator TEXT,
+        project_id TEXT
+      );
+    `);
+    const workspaceRoot = path.resolve(tempCodexHome, 'workspace-proj');
+    stateDb
+      .prepare(`INSERT INTO projects (id, name, position, created_at_ms, updated_at_ms) VALUES (?, ?, 0, 1000, 1000)`)
+      .run('proj_server_1', 'workspace-proj');
+    stateDb
+      .prepare(`INSERT INTO project_roots (project_id, position, path) VALUES (?, 0, ?)`)
+      .run('proj_server_1', workspaceRoot);
+    stateDb
+      .prepare(
+        `INSERT INTO threads (
+           id, rollout_path, created_at, updated_at, source, model_provider,
+           cwd, title, name, git_branch, thread_source, originator, project_id
+         ) VALUES (?, ?, 1700000000, 1700000010, 'vscode', 'custom', ?, '', NULL, 'main', 'unknown', 'reins', NULL)`,
+      )
+      .run('thr_sync_1', `\\\\?\\${rolloutPath}`, `\\\\?\\${workspaceRoot}`);
+    stateDb.close();
+
+    const catalogDb = new DatabaseSync(catalogDbPath);
+    catalogDb.exec(`
+      CREATE TABLE local_thread_catalog (
+        host_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        display_title TEXT NOT NULL,
+        source_created_at INTEGER NOT NULL,
+        source_updated_at INTEGER NOT NULL,
+        cwd TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_detail TEXT,
+        model_provider TEXT NOT NULL,
+        git_branch TEXT,
+        observation_sequence INTEGER NOT NULL DEFAULT 0,
+        missing_candidate INTEGER NOT NULL DEFAULT 0,
+        thread_source TEXT,
+        source_recency_at INTEGER NOT NULL DEFAULT 0,
+        pending_observed_title INTEGER NOT NULL DEFAULT 0,
+        project_id TEXT,
+        PRIMARY KEY (host_id, thread_id)
+      );
+      CREATE TABLE local_thread_catalog_sync_state (
+        host_id TEXT PRIMARY KEY,
+        watermark_updated_at INTEGER,
+        last_full_reconciled_at INTEGER,
+        initial_build_complete INTEGER NOT NULL DEFAULT 1,
+        observation_sequence INTEGER NOT NULL DEFAULT 5
+      );
+      INSERT INTO local_thread_catalog_sync_state (host_id, observation_sequence) VALUES ('local', 5);
+      CREATE TABLE local_thread_catalog_metadata (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        schema_version INTEGER NOT NULL,
+        catalog_revision INTEGER NOT NULL DEFAULT 1
+      );
+      INSERT INTO local_thread_catalog_metadata (id, schema_version, catalog_revision) VALUES (1, 1, 10);
+    `);
+    catalogDb.close();
+
+    const res = await syncCodexDesktopCatalog({
+      threadId: 'thr_sync_1',
+      cwd: workspaceRoot,
+      title: '[Reins] Test Catalog Sync',
+      codexHome: tempCodexHome,
+      notifyRunningDesktop: false,
+    });
+    assert.equal(res.syncedStateDb, true);
+    assert.equal(res.syncedCatalogDb, true);
+
+    const checkStateDb = new DatabaseSync(stateDbPath);
+    const tRow = checkStateDb.prepare(`SELECT * FROM threads WHERE id = 'thr_sync_1'`).get();
+    checkStateDb.close();
+    assert.equal(tRow.originator, 'Codex Desktop');
+    assert.equal(tRow.thread_source, 'user');
+    assert.equal(tRow.cwd, workspaceRoot);
+    assert.equal(tRow.project_id, 'proj_server_1');
+    assert.equal(tRow.title, '[Reins] Test Catalog Sync');
+    assert.equal(tRow.name, '[Reins] Test Catalog Sync');
+
+    const checkCatalogDb = new DatabaseSync(catalogDbPath);
+    const cRow = checkCatalogDb
+      .prepare(`SELECT * FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'thr_sync_1'`)
+      .get();
+    checkCatalogDb.close();
+    assert.equal(cRow.display_title, '[Reins] Test Catalog Sync');
+    assert.equal(cRow.cwd, workspaceRoot);
+    assert.equal(cRow.source_kind, 'vscode');
+    assert.equal(cRow.thread_source, 'user');
+    assert.equal(cRow.project_id, 'proj_server_1');
+    assert.equal(cRow.observation_sequence, 6);
+
+    const patchedRollout = fs.readFileSync(rolloutPath, 'utf8');
+    assert.match(patchedRollout, /"originator":"Codex Desktop"/);
+  } finally {
+    fs.rmSync(tempCodexHome, { recursive: true, force: true });
   }
 });
