@@ -16,6 +16,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { TaskManager } from '../hub/task-manager.js';
 import {
+  REASONING_EFFORTS,
   REIN_POLICIES,
   SESSION_MODES,
   STEER_ACTIONS,
@@ -27,10 +28,19 @@ export const MCP_TOOLS = Object.freeze([
   {
     name: 'reins_targets',
     description:
-      'List all local and remote AI coding harnesses (Codex, Antigravity, DSH, Claude Code) registered in Reins along with their session modes, policies, and availability.',
+      'List all local and remote AI coding harnesses (Codex, Antigravity, DSH, Claude Code) registered in Reins along with their session modes, policies, and availability. Pass targetId or includeModels=true to also retrieve selectable models and reasoning effort levels.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        targetId: {
+          type: 'string',
+          description: 'Optional target ID (e.g., "local-codex") to inspect along with its selectable models and reasoning efforts.',
+        },
+        includeModels: {
+          type: 'boolean',
+          description: 'If true, query selectable models and reasoning effort levels for the specified targetId (or Codex targets).',
+        },
+      },
       additionalProperties: false,
     },
   },
@@ -76,7 +86,12 @@ export const MCP_TOOLS = Object.freeze([
         },
         model: {
           type: 'string',
-          description: 'Optional model override.',
+          description: 'Optional model override (e.g., "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna").',
+        },
+        effort: {
+          type: 'string',
+          enum: REASONING_EFFORTS,
+          description: 'Optional reasoning effort override ("low", "medium", "high", "xhigh", "max", "ultra").',
         },
         wait: {
           type: 'boolean',
@@ -138,6 +153,15 @@ export const MCP_TOOLS = Object.freeze([
         message: {
           type: 'string',
           description: 'Follow-up prompt message when action="reply".',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional model override for the steered turn.',
+        },
+        effort: {
+          type: 'string',
+          enum: REASONING_EFFORTS,
+          description: 'Optional reasoning effort override for the steered turn ("low", "medium", "high", "xhigh", "max", "ultra").',
         },
         wait: {
           type: 'boolean',
@@ -271,12 +295,34 @@ export class ReinsMcpServer {
   async callTool(name, args = {}) {
     try {
       if (name === 'reins_targets') {
-        const targets = this.taskManager.registry.listTargets();
+        const allTargets = this.taskManager.registry.listTargets();
+        const targets = args.targetId
+          ? allTargets.filter((t) => t.id === args.targetId)
+          : allTargets;
+        let modelCatalog;
+        if (args.targetId || args.includeModels) {
+          const modelTargetId = args.targetId || 'local-codex';
+          try {
+            modelCatalog = await this.taskManager.listModels(modelTargetId);
+          } catch (err) {
+            modelCatalog = {
+              targetId: modelTargetId,
+              error: err.message || String(err),
+            };
+          }
+        }
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ targets }, null, 2),
+              text: JSON.stringify(
+                {
+                  targets,
+                  ...(modelCatalog ? { modelCatalog } : {}),
+                },
+                null,
+                2,
+              ),
             },
           ],
         };
@@ -292,6 +338,7 @@ export class ReinsMcpServer {
           sessionId: args.sessionId,
           cwd: args.cwd,
           model: args.model,
+          effort: args.effort,
           wait: args.wait ?? true,
           timeoutSec: args.timeoutSec,
         });
@@ -340,6 +387,8 @@ export class ReinsMcpServer {
         const snapshot = await this.taskManager.steer(args.taskId, {
           action: args.action,
           message: args.message,
+          model: args.model,
+          effort: args.effort,
           wait: args.wait ?? true,
         });
         return {

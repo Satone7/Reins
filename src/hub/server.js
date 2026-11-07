@@ -108,6 +108,13 @@ export class ReinsHubServer {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/models') {
+      const targetId = url.searchParams.get('targetId') || 'local-codex';
+      const catalog = await this.taskManager.listModels(targetId);
+      this._sendJson(res, 200, catalog);
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/tasks') {
       const status = url.searchParams.get('status') || undefined;
       const targetId = url.searchParams.get('targetId') || undefined;

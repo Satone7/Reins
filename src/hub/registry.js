@@ -335,6 +335,16 @@ export function normalizeTargetConfig(id, raw = {}) {
     raw.tmuxPrefix ||
     driverObj?.tmuxPrefix ||
     undefined;
+  const model =
+    raw.model ||
+    driverObj?.model ||
+    undefined;
+  const effort =
+    raw.effort ||
+    raw.reasoningEffort ||
+    driverObj?.effort ||
+    driverObj?.reasoningEffort ||
+    undefined;
 
   return {
     ...raw,
@@ -348,6 +358,8 @@ export function normalizeTargetConfig(id, raw = {}) {
     defaultPolicy,
     defaultSessionMode,
     description,
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
     ...(tmuxSession ? { tmuxSession } : {}),
     ...(tmuxPrefix ? { tmuxPrefix } : {}),
   };
@@ -500,6 +512,8 @@ export class TargetRegistry {
         defaultCwd: target.defaultCwd || process.cwd(),
         defaultPolicy: target.defaultPolicy || 'parent-rein',
         defaultSessionMode: target.defaultSessionMode || 'persistent',
+        ...(target.model ? { model: target.model } : {}),
+        ...(target.effort ? { effort: target.effort } : {}),
         description: target.description || '',
         available,
         resolvedExecutable,

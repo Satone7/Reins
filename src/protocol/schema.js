@@ -60,6 +60,15 @@ export const STEER_ACTIONS = Object.freeze([
   'interrupt',
 ]);
 
+export const REASONING_EFFORTS = Object.freeze([
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]);
+
 /**
  * Resolves the effective session lifecycle mode (`persistent` vs `ephemeral`).
  *
@@ -252,6 +261,12 @@ export function formatDiagnosticSummary(snapshot) {
     `status=${snapshot.status}`,
     `mode=${snapshot.sessionMode}`,
   ];
+  if (snapshot.model) {
+    parts.push(`model=${snapshot.model}`);
+  }
+  if (snapshot.effort) {
+    parts.push(`effort=${snapshot.effort}`);
+  }
   if (snapshot.sessionId) {
     parts.push(`sessionId=${snapshot.sessionId}`);
   }
@@ -285,6 +300,7 @@ export function createInitialTaskSnapshot({
   preset = 'task',
   cwd,
   model,
+  effort,
   sessionId,
   transportType = 'local',
   sshHost,
@@ -302,6 +318,7 @@ export function createInitialTaskSnapshot({
     preset,
     cwd,
     model: model || undefined,
+    effort: effort || undefined,
     resumeCommandHint: buildResumeCommandHint({
       kind,
       sessionId,

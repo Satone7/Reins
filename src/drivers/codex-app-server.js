@@ -538,6 +538,101 @@ export class CodexAppServerDriver {
   }
 
   /**
+   * Queries `codex app-server --stdio` for all selectable models, their supported
+   * reasoning efforts, and the current user-configured defaults.
+   *
+   * @param {object} [options]
+   * @param {string} [options.cwd]
+   * @param {Record<string, string>} [options.envVars={}]
+   * @param {number} [options.timeoutMs=15000]
+   * @returns {Promise<object>}
+   */
+  async listModels({ cwd, envVars = {}, timeoutMs = 15000 } = {}) {
+    const transportConfig = this.targetConfig.transport;
+    const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
+    const command = isSsh
+      ? (this.targetConfig.command && this.targetConfig.command !== 'auto' ? this.targetConfig.command : 'codex')
+      : resolveExecutable(this.targetConfig.command || 'auto', 'codex');
+    const args = Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
+      ? this.targetConfig.args
+      : ['app-server', '--stdio'];
+
+    const transport = createJsonRpcTransport({
+      transportConfig,
+      command,
+      args,
+      cwd: cwd || this.targetConfig.defaultCwd || process.cwd(),
+      env: {
+        ...(this.targetConfig.env || {}),
+        ...envVars,
+      },
+    });
+
+    try {
+      transport.start();
+      await transport.request(
+        'initialize',
+        {
+          clientInfo: {
+            name: 'reins',
+            title: 'Reins H2H Hub',
+            version: '0.1.0',
+          },
+          capabilities: {
+            experimentalApi: false,
+          },
+        },
+        timeoutMs,
+      );
+      transport.notify('initialized');
+
+      const [modelsRes, configRes] = await Promise.all([
+        transport.request('model/list', {}, timeoutMs),
+        transport.request('config/read', { includeLayers: false }, timeoutMs).catch(() => null),
+      ]);
+
+      const rawModels = Array.isArray(modelsRes?.data) ? modelsRes.data : [];
+      const userConfig = configRes?.config || {};
+
+      const models = rawModels.map((entry) => {
+        const efforts = Array.isArray(entry.supportedReasoningEfforts)
+          ? entry.supportedReasoningEfforts.map((r) => ({
+              effort: r.reasoningEffort || r.effort,
+              description: r.description || '',
+            }))
+          : [];
+        return {
+          id: entry.id || entry.model,
+          model: entry.model || entry.id,
+          displayName: entry.displayName || entry.model || entry.id,
+          description: entry.description || '',
+          isDefault: Boolean(entry.isDefault),
+          defaultEffort: entry.defaultReasoningEffort || null,
+          supportedEfforts: efforts.map((e) => e.effort).filter(Boolean),
+          effortDetails: efforts,
+          inputModalities: Array.isArray(entry.inputModalities) ? entry.inputModalities : ['text'],
+        };
+      });
+
+      return {
+        targetId: this.targetConfig.id || 'local-codex',
+        kind: 'codex',
+        currentConfig: {
+          model: this.targetConfig.model || userConfig.model || null,
+          effort:
+            this.targetConfig.effort ||
+            userConfig.model_reasoning_effort ||
+            null,
+          provider: userConfig.model_provider || null,
+        },
+        models,
+      };
+    } finally {
+      await transport.close().catch(() => {});
+    }
+  }
+
+  /**
    * Executes or resumes a turn on a local or remote Codex `app-server` instance.
    *
    * @param {object} snapshot - Mutable H2HTaskSnapshot instance
@@ -685,6 +780,10 @@ export class CodexAppServerDriver {
       // 2. Map ReinPolicy to Codex sandbox and approval parameters
       const { approvalPolicy, sandbox } = mapReinPolicyToCodex(snapshot.reinPolicy);
       const effectiveModel = snapshot.model || this.targetConfig.model || null;
+      const effectiveEffort = snapshot.effort || this.targetConfig.effort || null;
+      const threadConfigOverrides = effectiveEffort
+        ? { model_reasoning_effort: effectiveEffort }
+        : undefined;
 
       // 3. Start a new thread or resume an existing persistent session
       const isNewThread = !runtime.threadId;
@@ -694,7 +793,8 @@ export class CodexAppServerDriver {
           {
             threadId: runtime.threadId,
             cwd: snapshot.cwd || process.cwd(),
-            model: effectiveModel,
+            ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(threadConfigOverrides ? { config: threadConfigOverrides } : {}),
             approvalPolicy,
             sandbox,
             excludeTurns: true,
@@ -702,13 +802,20 @@ export class CodexAppServerDriver {
           30000,
         );
         runtime.threadId = resumeRes?.thread?.id || runtime.threadId;
+        if (resumeRes?.model && !snapshot.model) {
+          snapshot.model = resumeRes.model;
+        }
+        if ((resumeRes?.reasoningEffort || effectiveEffort) && !snapshot.effort) {
+          snapshot.effort = resumeRes?.reasoningEffort || effectiveEffort;
+        }
       } else {
         const startRes = await transport.request(
           'thread/start',
           {
             cwd: snapshot.cwd || process.cwd(),
             ephemeral: snapshot.sessionMode === 'ephemeral',
-            model: effectiveModel,
+            ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(threadConfigOverrides ? { config: threadConfigOverrides } : {}),
             approvalPolicy,
             approvalsReviewer: 'user',
             sandbox,
@@ -718,6 +825,9 @@ export class CodexAppServerDriver {
         runtime.threadId = startRes?.thread?.id;
         if (startRes?.model && !snapshot.model) {
           snapshot.model = startRes.model;
+        }
+        if ((startRes?.reasoningEffort || effectiveEffort) && !snapshot.effort) {
+          snapshot.effort = startRes?.reasoningEffort || effectiveEffort;
         }
       }
 
@@ -770,6 +880,8 @@ export class CodexAppServerDriver {
         'turn/start',
         {
           threadId: runtime.threadId,
+          ...(effectiveModel ? { model: effectiveModel } : {}),
+          ...(effectiveEffort ? { effort: effectiveEffort } : {}),
           input: [
             {
               type: 'text',

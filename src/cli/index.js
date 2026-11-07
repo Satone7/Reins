@@ -24,6 +24,7 @@ Usage:
 
 Commands:
   targets                           List all registered H2H Harness targets
+  models [targetId]                 List selectable models and reasoning efforts for a target (default: local-codex)
   delegate <targetId> [options]     Delegate a task or resume a session on a target Harness
   status [taskId] [options]         Query status/transcript of a task or list recent tasks
   steer <taskId> <action> [msg]     Steer a task (reply | approve | reject | interrupt)
@@ -40,7 +41,8 @@ Delegate Options:
   --policy <policy>                 Policy: free-rein | auto-edit | parent-rein | tight-rein | plan-only
   --session <sessionId>             Resume an existing native Harness session ID
   --cwd <path>                      Working directory on the target host
-  --model <model>                   Override model identifier
+  --model <model>                   Override model identifier (e.g. gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-6-luna)
+  --effort <level>                  Reasoning effort level (low | medium | high | xhigh | max | ultra)
   --wait                            Wait for the turn to complete (default)
   --bg                              Run asynchronously in the background and return taskId immediately
   --timeout <sec>                   Turn timeout in seconds (default: 600)
@@ -98,6 +100,8 @@ export function parseCliArgs(argv) {
       flags.cwd = argv[++i];
     } else if (arg === '--model') {
       flags.model = argv[++i];
+    } else if (arg === '--effort' || arg === '--reasoning-effort') {
+      flags.effort = argv[++i];
     } else if (arg === '--timeout') {
       flags.timeout = Number.parseInt(argv[++i], 10);
     } else if (arg === '--status') {
@@ -191,6 +195,49 @@ export async function runCli(argv) {
       return;
     }
 
+    if (command === 'models') {
+      const targetId = positionals[1] || 'local-codex';
+      const catalog = await taskManager.listModels(targetId);
+      if (flags.json) {
+        console.log(JSON.stringify(catalog, null, 2));
+      } else {
+        console.log(
+          `Selectable Models for ${catalog.targetId} (${catalog.kind}):`,
+        );
+        if (catalog.currentConfig?.model || catalog.currentConfig?.effort) {
+          console.log(
+            `  Current Default : model=${catalog.currentConfig.model || '(default)'}, effort=${catalog.currentConfig.effort || '(default)'}${catalog.currentConfig.provider ? `, provider=${catalog.currentConfig.provider}` : ''}`,
+          );
+        }
+        console.log('');
+        if (!catalog.models || catalog.models.length === 0) {
+          console.log('  (No dynamic model catalog reported by this target driver)');
+        } else {
+          for (const m of catalog.models) {
+            const defaultTag = m.isDefault ? ' [catalog-default]' : '';
+            const activeTag =
+              catalog.currentConfig?.model && catalog.currentConfig.model === m.id
+                ? ' [configured-default]'
+                : '';
+            const effortsStr =
+              Array.isArray(m.supportedEfforts) && m.supportedEfforts.length > 0
+                ? m.supportedEfforts.join(' | ')
+                : 'default';
+            console.log(
+              `  - ${m.id.padEnd(16)} (${m.displayName})${defaultTag}${activeTag}`,
+            );
+            console.log(
+              `      efforts: [${effortsStr}] (default effort: ${m.defaultEffort || 'default'})`,
+            );
+            if (m.description) {
+              console.log(`      ${m.description}`);
+            }
+          }
+        }
+      }
+      return;
+    }
+
     if (command === 'delegate') {
       const targetId = positionals[1];
       if (!targetId) {
@@ -220,6 +267,7 @@ export async function runCli(argv) {
         sessionId: flags.session,
         cwd: flags.cwd,
         model: flags.model,
+        effort: flags.effort,
         wait: flags.wait,
         detachWorker: !flags.wait,
         timeoutSec: flags.timeout,
@@ -292,6 +340,8 @@ export async function runCli(argv) {
       const snapshot = await taskManager.steer(taskId, {
         action,
         message,
+        model: flags.model,
+        effort: flags.effort,
         wait: flags.wait,
       });
 

@@ -30,8 +30,11 @@ Always pass `--json` when calling `reins` programmatically so you receive the st
 # 1. Discover available local & remote harness targets and active sessions
 reins targets --json
 
-# 2. Delegate a substantial/multi-turn task as a first-class persistent session
-reins delegate <target> --persistent --desc "Short task summary" --wait 60 --json --prompt-stdin <<'EOF'
+# 1b. Query selectable models and reasoning effort levels for a target (e.g. local-codex)
+reins models local-codex --json
+
+# 2. Delegate a substantial/multi-turn task as a first-class persistent session (optionally choosing --model and --effort)
+reins delegate <target> --persistent --model gpt-6.1-sol --effort high --json --prompt-stdin <<'EOF'
 Your multi-line task instructions here...
 EOF
 

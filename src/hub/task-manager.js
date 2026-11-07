@@ -212,6 +212,44 @@ export class TaskManager {
   }
 
   /**
+   * Queries selectable models and reasoning efforts for a registered target.
+   *
+   * @param {string} [targetId='local-codex']
+   * @returns {Promise<object>}
+   */
+  async listModels(targetId = 'local-codex') {
+    const target = this.registry.getTargetOrThrow(targetId);
+    const driver = this.getDriver(target);
+    if (typeof driver.listModels === 'function') {
+      return driver.listModels({ cwd: target.defaultCwd });
+    }
+    return {
+      targetId: target.id,
+      kind: target.kind,
+      currentConfig: {
+        model: target.model || null,
+        effort: target.effort || null,
+        provider: null,
+      },
+      models: target.model
+        ? [
+            {
+              id: target.model,
+              model: target.model,
+              displayName: target.model,
+              description: `Configured default model for ${target.id}`,
+              isDefault: true,
+              defaultEffort: target.effort || null,
+              supportedEfforts: target.effort ? [target.effort] : [],
+              effortDetails: [],
+              inputModalities: ['text'],
+            },
+          ]
+        : [],
+    };
+  }
+
+  /**
    * Delegates a new task (or resumes a session) on the specified target.
    *
    * @param {object} request
@@ -223,6 +261,7 @@ export class TaskManager {
    * @param {string} [request.sessionId]
    * @param {string} [request.cwd]
    * @param {string} [request.model]
+   * @param {string} [request.effort]
    * @param {boolean} [request.wait=true]
    * @param {boolean} [request.detachWorker=false]
    * @param {number} [request.timeoutSec]
@@ -239,6 +278,7 @@ export class TaskManager {
       sessionId,
       cwd,
       model,
+      effort,
       wait = true,
       detachWorker = false,
       timeoutSec,
@@ -289,6 +329,7 @@ export class TaskManager {
       preset,
       cwd: effectiveCwd,
       model: model || target.model,
+      effort: effort || target.effort,
       sessionId,
       transportType: target.transport?.type || 'local',
       sshHost: target.transport?.host,
@@ -397,13 +438,22 @@ export class TaskManager {
    * @param {object} params
    * @param {'reply' | 'approve' | 'reject' | 'interrupt'} params.action
    * @param {string} [params.message]
+   * @param {string} [params.model]
+   * @param {string} [params.effort]
    * @param {boolean} [params.wait=true]
    * @returns {Promise<object>} Updated H2HTaskSnapshot
    */
-  async steer(taskId, { action, message, wait = true }) {
+  async steer(taskId, { action, message, model, effort, wait = true }) {
     const snapshot = this.getTask(taskId);
     if (!snapshot) {
       throw new Error(`Unknown taskId "${taskId}".`);
+    }
+
+    if (model) {
+      snapshot.model = model;
+    }
+    if (effort) {
+      snapshot.effort = effort;
     }
 
     const target = this.registry.getTargetOrThrow(snapshot.targetId);

@@ -12,9 +12,11 @@ import {
   buildResumeCommandHint,
   createInitialTaskSnapshot,
   mapReinPolicyToCodex,
+  REASONING_EFFORTS,
   resolveReinPolicy,
   resolveSessionMode,
 } from '../src/protocol/schema.js';
+import { parseCliArgs } from '../src/cli/index.js';
 import { advanceTraceOrThrow } from '../src/hub/loop-guard.js';
 import { normalizeTargetConfig, parseSimpleYaml, TargetRegistry } from '../src/hub/registry.js';
 import { TaskManager } from '../src/hub/task-manager.js';
@@ -1002,5 +1004,117 @@ test('Codex Desktop catalog sync normalizes Windows extended paths and registers
     assert.match(patchedRollout, /"originator":"Codex Desktop"/);
   } finally {
     fs.rmSync(tempCodexHome, { recursive: true, force: true });
+  }
+});
+
+test('Model catalog and reasoning effort selection propagate across CLI, MCP, and TaskManager', async () => {
+  assert.ok(REASONING_EFFORTS.includes('low'));
+  assert.ok(REASONING_EFFORTS.includes('ultra'));
+
+  const parsedCli = parseCliArgs([
+    'delegate',
+    'local-codex',
+    '--model',
+    'gpt-6.1-sol',
+    '--effort',
+    'high',
+    '-p',
+    'Build feature',
+  ]);
+  assert.equal(parsedCli.positionals[0], 'delegate');
+  assert.equal(parsedCli.positionals[1], 'local-codex');
+  assert.equal(parsedCli.flags.model, 'gpt-6.1-sol');
+  assert.equal(parsedCli.flags.effort, 'high');
+
+  const tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-models-test-'));
+  const traceKeys = ['REINS_TRACE_ID', 'REINS_HOP_COUNT', 'REINS_MAX_HOPS', 'REINS_CALL_CHAIN'];
+  const inheritedTrace = Object.fromEntries(traceKeys.map((key) => [key, process.env[key]]));
+  for (const key of traceKeys) delete process.env[key];
+
+  try {
+    const mockDriver = {
+      async listModels() {
+        return {
+          targetId: 'local-codex',
+          kind: 'codex',
+          currentConfig: { model: 'gpt-6-sol', effort: 'high', provider: 'custom' },
+          models: [
+            {
+              id: 'gpt-6.1-sol',
+              model: 'gpt-6.1-sol',
+              displayName: 'GPT-6.1-Sol',
+              isDefault: true,
+              defaultEffort: 'low',
+              supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+            },
+          ],
+        };
+      },
+      async runTurn(snapshot, { prompt }, onUpdate) {
+        snapshot.status = 'completed';
+        snapshot.stopReason = 'end_turn';
+        snapshot.sessionId = snapshot.sessionId || 'thr_effort_1';
+        snapshot.output = `model=${snapshot.model} effort=${snapshot.effort} prompt=${prompt}`;
+        snapshot.metrics.turnCount += 1;
+        onUpdate(snapshot);
+        return snapshot;
+      },
+      async steerLive() {
+        return { handledLive: false };
+      },
+      async abort() {
+        return true;
+      },
+    };
+
+    const taskManager = new TaskManager({
+      stateDir: tempStateDir,
+      driverOverrides: {
+        'codex-app-server': mockDriver,
+      },
+    });
+    const mcp = new ReinsMcpServer({ taskManager });
+
+    const targetsRes = await mcp.handleMessage({
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'tools/call',
+      params: {
+        name: 'reins_targets',
+        arguments: { targetId: 'local-codex', includeModels: true },
+      },
+    });
+    const targetsPayload = JSON.parse(targetsRes.result.content[0].text);
+    assert.equal(targetsPayload.modelCatalog.currentConfig.model, 'gpt-6-sol');
+    assert.equal(targetsPayload.modelCatalog.currentConfig.effort, 'high');
+    assert.equal(targetsPayload.modelCatalog.models[0].id, 'gpt-6.1-sol');
+
+    const delRes = await mcp.handleMessage({
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: {
+        name: 'reins_delegate',
+        arguments: {
+          targetId: 'local-codex',
+          prompt: 'Verify effort',
+          sessionMode: 'persistent',
+          model: 'gpt-6.1-sol',
+          effort: 'xhigh',
+        },
+      },
+    });
+    const snap = JSON.parse(delRes.result.content[0].text);
+    assert.equal(snap.model, 'gpt-6.1-sol');
+    assert.equal(snap.effort, 'xhigh');
+    assert.match(snap.diagnostic, /model=gpt-6\.1-sol/);
+    assert.match(snap.diagnostic, /effort=xhigh/);
+    assert.match(snap.output, /model=gpt-6\.1-sol effort=xhigh/);
+  } finally {
+    for (const key of traceKeys) {
+      if (inheritedTrace[key] === undefined) delete process.env[key];
+      else process.env[key] = inheritedTrace[key];
+    }
+    fs.rmSync(tempStateDir, { recursive: true, force: true });
   }
 });
