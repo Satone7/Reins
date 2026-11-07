@@ -1,18 +1,29 @@
 #!/usr/bin/env node
 
 /**
- * Reins — H2H (Harness-to-Harness) MCP Server & Remote Control Hub
+ * Reins — H2H (Harness-to-Harness) CLI, Agent Skill & MCP Orchestration Hub
  *
- * Entry point placeholder.
- * See:
- *   - docs/ARCHITECTURE.md
- *   - docs/H2H_PROTOCOL.md
- *   - research/PROTOCOLS_AND_ECOSYSTEM.md
+ * Main entry point (`reins` binary and programmatic SDK exports).
  */
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { runCli } from './cli/index.js';
 
 export const VERSION = '0.1.0';
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
-  console.log(`Reins v${VERSION} — Take the reins of your local and remote AI harnesses.`);
-  console.log('Run Mode: Initialization skeleton ready. See docs/ARCHITECTURE.md for Milestone 1 implementation plan.');
+export * from './protocol/schema.js';
+export { advanceTraceOrThrow, resolveIncomingTrace } from './hub/loop-guard.js';
+export { TargetRegistry, loadConfig, parseSimpleYaml } from './hub/registry.js';
+export { TaskManager } from './hub/task-manager.js';
+export { ReinsHubServer } from './hub/server.js';
+export { ReinsMcpServer, MCP_TOOLS } from './mcp/index.js';
+export { CodexAppServerDriver } from './drivers/codex-app-server.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const isDirectMain =
+  process.argv[1] && path.resolve(__filename) === path.resolve(process.argv[1]);
+
+if (isDirectMain) {
+  runCli(process.argv.slice(2));
 }
