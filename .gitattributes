@@ -1,0 +1,21 @@
+# Auto detect text files and normalize to LF across Windows & Linux
+* text=auto eol=lf
+
+# Explicitly enforce LF for source code, scripts, and configs
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
