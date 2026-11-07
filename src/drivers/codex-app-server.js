@@ -10,7 +10,8 @@
  * - Interactive approval interception (`attention_required`) and live turn steering
  */
 
-import { JsonRpcStdioTransport, resolveExecutable } from '../transports/local.js';
+import { resolveExecutable } from '../transports/local.js';
+import { createJsonRpcTransport } from '../transports/ssh.js';
 import {
   applyPresetPrompt,
   buildResumeCommandHint,
@@ -29,7 +30,7 @@ export class CodexAppServerDriver {
   }
 
   /**
-   * Executes or resumes a turn on the local Codex `app-server` instance.
+   * Executes or resumes a turn on a local or remote Codex `app-server` instance.
    *
    * @param {object} snapshot - Mutable H2HTaskSnapshot instance
    * @param {object} options
@@ -40,12 +41,17 @@ export class CodexAppServerDriver {
    * @returns {Promise<object>} Finalized or attention-paused H2HTaskSnapshot
    */
   async runTurn(snapshot, { prompt, envVars = {}, timeoutMs = 600000 }, onUpdate = () => {}) {
-    const command = resolveExecutable(this.targetConfig.command || 'auto', 'codex');
+    const transportConfig = this.targetConfig.transport;
+    const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
+    const command = isSsh
+      ? (this.targetConfig.command && this.targetConfig.command !== 'auto' ? this.targetConfig.command : 'codex')
+      : resolveExecutable(this.targetConfig.command || 'auto', 'codex');
     const args = Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
       ? this.targetConfig.args
       : ['app-server', '--stdio'];
 
-    const transport = new JsonRpcStdioTransport({
+    const transport = createJsonRpcTransport({
+      transportConfig,
       command,
       args,
       cwd: snapshot.cwd || process.cwd(),
@@ -99,6 +105,14 @@ export class CodexAppServerDriver {
 
     transport.on('request', (id, method, params) => {
       this._handleServerRequest(runtime, id, method, params, appendEvent, emitUpdate);
+    });
+
+    transport.on('error', (err) => {
+      snapshot.status = 'failed';
+      snapshot.stopReason = 'error';
+      snapshot.error = err.message || String(err);
+      emitUpdate();
+      runtime.turnDoneResolve(snapshot);
     });
 
     transport.on('exit', (code, signal) => {
@@ -199,7 +213,7 @@ export class CodexAppServerDriver {
         kind: 'codex',
         sessionId: snapshot.sessionId,
         sessionMode: snapshot.sessionMode,
-        transportType: this.targetConfig.transport?.type || 'local',
+        transportType: this.targetConfig.transport?.type || this.targetConfig.transport?.kind || 'local',
         sshHost: this.targetConfig.transport?.host,
       });
       emitUpdate();

@@ -19,6 +19,17 @@ export { TaskManager } from './hub/task-manager.js';
 export { ReinsHubServer } from './hub/server.js';
 export { ReinsMcpServer, MCP_TOOLS } from './mcp/index.js';
 export { CodexAppServerDriver } from './drivers/codex-app-server.js';
+export { AntigravityDriver } from './drivers/antigravity-driver.js';
+export { DshDriver } from './drivers/dsh-driver.js';
+export { ClaudeCodeDriver } from './drivers/claude-code-driver.js';
+export {
+  buildSshArgs,
+  quotePosixShellArg,
+  buildPosixCommandLine,
+  execRemoteCommand,
+  SshStdioTransport,
+  createJsonRpcTransport,
+} from './transports/ssh.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const isDirectMain =

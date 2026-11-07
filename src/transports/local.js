@@ -8,6 +8,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { EventEmitter } from 'node:events';
@@ -118,6 +119,16 @@ export function resolveExecutable(commandSpec = 'auto', harnessKind = 'codex') {
     const appxPath = resolveWindowsAppxCodexPath();
     if (appxPath) {
       return appxPath;
+    }
+  }
+
+  if (process.platform === 'win32' && binaryToFind === 'agy') {
+    const candidates = [
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity', 'Antigravity.exe'),
+      path.join(os.homedir(), '.gemini', 'antigravity-cli'),
+    ];
+    for (const candidate of candidates) {
+      if (candidate && fs.existsSync(candidate)) return candidate;
     }
   }
 

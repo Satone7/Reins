@@ -21,6 +21,9 @@ import {
 import { advanceTraceOrThrow } from './loop-guard.js';
 import { expandHome, TargetRegistry } from './registry.js';
 import { CodexAppServerDriver } from '../drivers/codex-app-server.js';
+import { AntigravityDriver } from '../drivers/antigravity-driver.js';
+import { DshDriver } from '../drivers/dsh-driver.js';
+import { ClaudeCodeDriver } from '../drivers/claude-code-driver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,10 +74,33 @@ export class TaskManager {
       case 'codex-app-server':
         driver = new CodexAppServerDriver(target);
         break;
+      case 'agy-cli':
+      case 'antigravity-cli':
+      case 'antigravity-sdk':
+        driver = new AntigravityDriver(target);
+        break;
+      case 'acp':
+      case 'acp-stdio':
+      case 'dsh-sdk':
+        driver = new DshDriver(target);
+        break;
+      case 'claude-tmux':
+      case 'claude-print':
+      case 'claude-cli':
+        driver = new ClaudeCodeDriver(target);
+        break;
       default:
-        throw new Error(
-          `Southbound driver "${target.driver}" for target "${target.id}" (${target.kind}) is not yet registered.`,
-        );
+        if (target.kind === 'antigravity') {
+          driver = new AntigravityDriver(target);
+        } else if (target.kind === 'dsh') {
+          driver = new DshDriver(target);
+        } else if (target.kind === 'claude-code') {
+          driver = new ClaudeCodeDriver(target);
+        } else {
+          throw new Error(
+            `Southbound driver "${target.driver}" for target "${target.id}" (${target.kind}) is not yet registered.`,
+          );
+        }
     }
 
     this.drivers.set(target.id, driver);
@@ -381,8 +407,12 @@ export class TaskManager {
     const target = this.registry.getTargetOrThrow(snapshot.targetId);
     const driver = this.getDriver(target);
 
-    const { handledLive } = await driver.steerLive(taskId, { action, message });
+    const { handledLive, snapshot: steeredSnapshot } = await driver.steerLive(taskId, { action, message, snapshot });
     if (handledLive) {
+      if (steeredSnapshot) {
+        this.saveSnapshot(steeredSnapshot);
+        return steeredSnapshot;
+      }
       return this.getTask(taskId);
     }
 
@@ -452,7 +482,7 @@ export class TaskManager {
 
     const target = this.registry.getTargetOrThrow(snapshot.targetId);
     const driver = this.getDriver(target);
-    const abortedInProcess = await driver.abort(taskId);
+    const abortedInProcess = await driver.abort(taskId, snapshot);
 
     if (!abortedInProcess && snapshot.workerPid && snapshot.workerPid !== process.pid) {
       if (process.platform === 'win32') {

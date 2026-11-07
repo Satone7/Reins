@@ -323,6 +323,10 @@ export function normalizeTargetConfig(id, raw = {}) {
 
   const tmuxSession =
     raw.tmuxSession ||
+    driverObj?.tmuxSession ||
+    undefined;
+  const tmuxPrefix =
+    raw.tmuxPrefix ||
     driverObj?.tmuxPrefix ||
     undefined;
 
@@ -339,6 +343,7 @@ export function normalizeTargetConfig(id, raw = {}) {
     defaultSessionMode,
     description,
     ...(tmuxSession ? { tmuxSession } : {}),
+    ...(tmuxPrefix ? { tmuxPrefix } : {}),
   };
 }
 

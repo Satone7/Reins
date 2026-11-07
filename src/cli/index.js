@@ -274,7 +274,16 @@ export async function runCli(argv) {
     if (command === 'steer') {
       const taskId = positionals[1];
       const action = positionals[2];
-      const message = flags.prompt || positionals.slice(3).join(' ') || undefined;
+      let message = flags.prompt;
+      if (!message && flags.promptFile) {
+        message = fs.readFileSync(flags.promptFile, 'utf8');
+      }
+      if (!message && flags.promptStdin) {
+        message = await readStdinText();
+      }
+      if (!message && positionals.length > 3) {
+        message = positionals.slice(3).join(' ');
+      }
 
       if (!taskId || !action) {
         throw new Error('Usage: reins steer <taskId> <reply|approve|reject|interrupt> [message]');
