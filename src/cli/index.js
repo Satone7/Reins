@@ -11,6 +11,7 @@
  */
 
 import fs from 'node:fs';
+import { TargetRegistry } from '../hub/registry.js';
 import { TaskManager } from '../hub/task-manager.js';
 import { ReinsHubServer } from '../hub/server.js';
 
@@ -41,6 +42,8 @@ Delegate Options:
   --policy <policy>                 Policy: free-rein | auto-edit | parent-rein | tight-rein | plan-only
   --session <sessionId>             Resume an existing native Harness session ID
   --cwd <path>                      Working directory on the target host
+  --project-root <path>             Explicit project root directory for Project Onboarding
+  --project-id <id>                 Explicit native project ID in the target Harness
   --model <model>                   Override model identifier (e.g. gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-6-luna)
   --effort <level>                  Reasoning effort level (low | medium | high | xhigh | max | ultra)
   --wait                            Wait for the turn to complete (default)
@@ -98,6 +101,12 @@ export function parseCliArgs(argv) {
       flags.session = argv[++i];
     } else if (arg === '--cwd') {
       flags.cwd = argv[++i];
+    } else if (arg === '--project-root') {
+      flags.projectRoot = argv[++i];
+    } else if (arg === '--project-id') {
+      flags.projectId = argv[++i];
+    } else if (arg === '--kill' || arg === '--terminate-session') {
+      flags.terminateSession = true;
     } else if (arg === '--model') {
       flags.model = argv[++i];
     } else if (arg === '--effort' || arg === '--reasoning-effort') {
@@ -163,7 +172,9 @@ export async function runCli(argv) {
     return;
   }
 
+  const registry = flags.config ? new TargetRegistry({ configPath: flags.config }) : undefined;
   const taskManager = new TaskManager({
+    registry,
     stateDir: flags.stateDir,
   });
 
@@ -258,6 +269,14 @@ export async function runCli(argv) {
         throw new Error('A non-empty prompt is required (-p "<text>", --prompt-file <path>, or --prompt-stdin).');
       }
 
+      const project =
+        flags.projectRoot || flags.projectId
+          ? {
+              ...(flags.projectId ? { id: flags.projectId } : {}),
+              ...(flags.projectRoot ? { root: flags.projectRoot } : {}),
+            }
+          : undefined;
+
       const snapshot = await taskManager.delegate({
         targetId,
         prompt,
@@ -266,10 +285,11 @@ export async function runCli(argv) {
         reinPolicy: flags.policy,
         sessionId: flags.session,
         cwd: flags.cwd,
+        project,
         model: flags.model,
         effort: flags.effort,
         wait: flags.wait,
-        detachWorker: !flags.wait,
+        detachWorker: true,
         timeoutSec: flags.timeout,
         allowTargetReentry: Boolean(flags.allowReentry),
       });
@@ -356,9 +376,11 @@ export async function runCli(argv) {
     if (command === 'abort') {
       const taskId = positionals[1];
       if (!taskId) {
-        throw new Error('Usage: reins abort <taskId>');
+        throw new Error('Usage: reins abort <taskId> [--kill]');
       }
-      const snapshot = await taskManager.abort(taskId);
+      const snapshot = await taskManager.abort(taskId, {
+        terminateSession: Boolean(flags.terminateSession),
+      });
       if (flags.json) {
         console.log(JSON.stringify(snapshot, null, 2));
       } else {

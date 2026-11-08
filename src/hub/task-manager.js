@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   createInitialTaskSnapshot,
   formatDiagnosticSummary,
+  normalizeSnapshotEnvelope,
   resolveReinPolicy,
   resolveSessionMode,
 } from '../protocol/schema.js';
@@ -48,6 +49,7 @@ export class TaskManager {
     this.driverOverrides = driverOverrides;
     this.drivers = new Map();
     this.memoryTasks = new Map();
+    this.activeExecutions = new Map();
 
     fs.mkdirSync(this.tasksDir, { recursive: true });
   }
@@ -132,11 +134,130 @@ export class TaskManager {
   }
 
   /**
+   * Returns the file path for a cross-process live steering control request.
+   *
+   * @param {string} taskId
+   * @returns {string}
+   */
+  _controlPath(taskId) {
+    const safeId = String(taskId).replace(/[^a-zA-Z0-9_-]/g, '');
+    return path.join(this.tasksDir, `${safeId}.control.json`);
+  }
+
+  /**
+   * Checks whether a local OS process PID is currently alive.
+   *
+   * @param {number} pid
+   * @returns {boolean}
+   */
+  _isPidAlive(pid) {
+    if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return err?.code === 'EPERM';
+    }
+  }
+
+  /**
+   * Starts a lightweight poller for cross-process / cross-manager `<taskId>.control.json`
+   * steering and abort commands while a turn is executing.
+   */
+  _startControlPoller(taskId, driver, executionPromise) {
+    const controlPath = this._controlPath(taskId);
+    let stopped = false;
+    let processing = false;
+    const timer = setInterval(async () => {
+      if (stopped || processing || !fs.existsSync(controlPath)) return;
+      processing = true;
+      let req;
+      try {
+        req = JSON.parse(fs.readFileSync(controlPath, 'utf8'));
+        fs.unlinkSync(controlPath);
+      } catch {
+        processing = false;
+        return;
+      }
+      if (!req || !req.action) {
+        processing = false;
+        return;
+      }
+      const activeExec = this.activeExecutions.get(taskId);
+      const snapshot = activeExec?.snapshot || this.getTask(taskId);
+      try {
+        if (req.action === 'abort') {
+          await driver.abort(taskId, snapshot, {
+            terminateSession: Boolean(req.terminateSession),
+            hasRemoteOwner: false,
+          });
+          if (snapshot) {
+            snapshot.status = 'aborted';
+            snapshot.stopReason = 'aborted';
+            snapshot.controlAckId = req.id || 'ack';
+            delete snapshot.controlError;
+            snapshot.metrics.updatedAt = new Date().toISOString();
+            snapshot.diagnostic = formatDiagnosticSummary(snapshot);
+            this.saveSnapshot(snapshot);
+          }
+          return;
+        }
+        if (req.model && snapshot) snapshot.model = req.model;
+        if (req.effort && snapshot) snapshot.effort = req.effort;
+        const { handledLive, snapshot: steered } = await driver.steerLive(taskId, {
+          action: req.action,
+          message: req.message,
+          snapshot,
+          wait: false,
+        });
+        const targetSnap = steered || snapshot;
+        if (targetSnap) {
+          targetSnap.controlAckId = req.id || 'ack';
+          delete targetSnap.controlError;
+          this.saveSnapshot(targetSnap);
+        }
+      } catch (err) {
+        if (snapshot) {
+          snapshot.error = err.message || String(err);
+          snapshot.controlError = err.message || String(err);
+          snapshot.controlAckId = req.id || 'ack';
+          if (req.action === 'abort') {
+            snapshot.status = 'aborted';
+            snapshot.stopReason = 'aborted';
+          }
+          snapshot.metrics.updatedAt = new Date().toISOString();
+          snapshot.diagnostic = formatDiagnosticSummary(snapshot);
+          this.saveSnapshot(snapshot);
+        }
+      } finally {
+        processing = false;
+      }
+    }, 40);
+    timer.unref?.();
+    const stop = () => {
+      if (processing) {
+        setTimeout(stop, 40).unref?.();
+        return;
+      }
+      stopped = true;
+      clearInterval(timer);
+      try {
+        if (fs.existsSync(controlPath)) fs.unlinkSync(controlPath);
+      } catch {
+        // Ignore cleanup race.
+      }
+    };
+    executionPromise.then(stop, stop);
+    return stop;
+  }
+
+  /**
    * Persists a task snapshot atomically to disk and updates the in-memory cache.
    *
    * @param {object} snapshot
    */
   saveSnapshot(snapshot) {
+    normalizeSnapshotEnvelope(snapshot);
     this.memoryTasks.set(snapshot.taskId, snapshot);
     const filePath = this._snapshotPath(snapshot.taskId);
     const tmpPath = `${filePath}.tmp.${process.pid}`;
@@ -186,7 +307,12 @@ export class TaskManager {
     if (fs.existsSync(this.tasksDir)) {
       const files = fs
         .readdirSync(this.tasksDir)
-        .filter((f) => f.endsWith('.json') && !f.endsWith('.request.json'));
+        .filter(
+          (f) =>
+            f.endsWith('.json') &&
+            !f.endsWith('.request.json') &&
+            !f.endsWith('.control.json'),
+        );
 
       for (const file of files) {
         try {
@@ -277,6 +403,7 @@ export class TaskManager {
       preset = 'task',
       sessionId,
       cwd,
+      project: requestProject,
       model,
       effort,
       wait = true,
@@ -294,7 +421,7 @@ export class TaskManager {
     }
 
     const target = this.registry.getTargetOrThrow(targetId);
-    const maxHops = this.registry.config?.hub?.maxHops || 4;
+    const maxHops = this.registry.config?.hub?.maxHops || 3;
 
     const { trace, envVars } = advanceTraceOrThrow({
       targetId: target.id,
@@ -315,6 +442,49 @@ export class TaskManager {
       targetDefaultPolicy: target.defaultPolicy,
     });
 
+    let effectiveProject = requestProject;
+    if (sessionId) {
+      const priorTasksForSession = this.listTasks({
+        targetId: target.id,
+        limit: Number.MAX_SAFE_INTEGER,
+      }).filter((t) => t.sessionId === sessionId);
+      if (priorTasksForSession.some((t) => t.sessionTerminated)) {
+        throw new Error(
+          `Session "${sessionId}" was terminated via abort --kill and cannot be resumed.`,
+        );
+      }
+      const priorTask = priorTasksForSession.find(
+        (t) => t.project && (t.project.id || t.project.root),
+      );
+      if (priorTask?.project) {
+        if (
+          requestProject?.id &&
+          priorTask.project.id &&
+          requestProject.id !== priorTask.project.id
+        ) {
+          throw new Error(
+            `[H2H-PROJ-05] Project binding mismatch: session "${sessionId}" is bound to project "${priorTask.project.id}", cannot rebind to "${requestProject.id}".`,
+          );
+        }
+        if (
+          requestProject?.root &&
+          priorTask.project.root &&
+          path.resolve(requestProject.root).toLowerCase() !==
+            path.resolve(priorTask.project.root).toLowerCase()
+        ) {
+          throw new Error(
+            `[H2H-PROJ-05] Project binding mismatch: session "${sessionId}" is bound to project root "${priorTask.project.root}", cannot rebind to "${requestProject.root}".`,
+          );
+        }
+        if (!effectiveProject) {
+          effectiveProject = {
+            id: priorTask.project.id || null,
+            root: priorTask.project.root || null,
+          };
+        }
+      }
+    }
+
     const effectiveCwd = cwd || target.defaultCwd || process.cwd();
     const taskId = `tsk_${crypto.randomBytes(6).toString('hex')}`;
     const timeoutMs =
@@ -328,6 +498,7 @@ export class TaskManager {
       reinPolicy,
       preset,
       cwd: effectiveCwd,
+      project: effectiveProject,
       model: model || target.model,
       effort: effort || target.effort,
       sessionId,
@@ -338,54 +509,141 @@ export class TaskManager {
 
     this.saveSnapshot(snapshot);
 
-    if (!wait && detachWorker) {
+    if (detachWorker) {
       fs.writeFileSync(
         this._requestPath(taskId),
         JSON.stringify({ prompt, envVars, timeoutMs }, null, 2),
         'utf8',
       );
-      const child = spawn(
-        process.execPath,
-        [CLI_ENTRY_PATH, '_worker', taskId, '--state-dir', this.stateDir],
-        {
-          cwd: process.cwd(),
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true,
-        },
-      );
+      const workerArgs = [CLI_ENTRY_PATH, '_worker', taskId, '--state-dir', this.stateDir];
+      if (
+        this.registry?.configSource &&
+        this.registry.configSource !== 'built-in defaults' &&
+        fs.existsSync(this.registry.configSource)
+      ) {
+        workerArgs.push('--config', this.registry.configSource);
+      }
+      const child = spawn(process.execPath, workerArgs, {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
       child.unref();
       snapshot.workerPid = child.pid;
       snapshot.status = 'running';
       snapshot.diagnostic = formatDiagnosticSummary(snapshot);
       this.saveSnapshot(snapshot);
-      return snapshot;
+      if (!wait) {
+        return snapshot;
+      }
+
+      const deadline = Date.now() + timeoutMs + 10000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 60));
+        const latest = this.getTask(taskId);
+        if (!latest) break;
+        if (
+          latest.status === 'completed' ||
+          latest.status === 'failed' ||
+          latest.status === 'aborted' ||
+          latest.status === 'attention_required'
+        ) {
+          return latest;
+        }
+        if (!this._isPidAlive(child.pid)) {
+          await new Promise((r) => setTimeout(r, 60));
+          const finalCheck = this.getTask(taskId) || latest;
+          if (finalCheck.status === 'running' || finalCheck.status === 'queued') {
+            finalCheck.status = 'failed';
+            finalCheck.stopReason = 'error';
+            finalCheck.error = finalCheck.error || 'Detached H2H worker exited unexpectedly.';
+            this.saveSnapshot(finalCheck);
+          }
+          return finalCheck;
+        }
+      }
+      return this.getTask(taskId) || snapshot;
     }
 
+    snapshot.workerPid = process.pid;
     const driver = this.getDriver(target);
+    const attentionWaiters = new Set();
+    const waitForNextStop = (ignoreRequestId = null) => {
+      if (
+        snapshot.status === 'attention_required' &&
+        (snapshot.attention?.requestId || null) !== ignoreRequestId
+      ) {
+        return Promise.resolve(snapshot);
+      }
+      if (
+        snapshot.status === 'completed' ||
+        snapshot.status === 'failed' ||
+        snapshot.status === 'aborted'
+      ) {
+        return Promise.resolve(snapshot);
+      }
+      return new Promise((resolve) => {
+        const waiter = (updated) => {
+          if (
+            updated.status === 'attention_required' &&
+            (updated.attention?.requestId || null) !== ignoreRequestId
+          ) {
+            attentionWaiters.delete(waiter);
+            resolve(updated);
+          }
+        };
+        attentionWaiters.add(waiter);
+        executionPromise.then(
+          (finalSnap) => {
+            attentionWaiters.delete(waiter);
+            resolve(finalSnap);
+          },
+          () => {
+            attentionWaiters.delete(waiter);
+            resolve(this.getTask(taskId) || snapshot);
+          },
+        );
+      });
+    };
+
     const executionPromise = driver.runTurn(
       snapshot,
       { prompt, envVars, timeoutMs },
       (updated) => {
         this.saveSnapshot(updated);
         onUpdate(updated);
+        if (updated.status === 'attention_required') {
+          for (const waiter of [...attentionWaiters]) {
+            waiter(updated);
+          }
+        }
       },
     );
+    this.activeExecutions.set(taskId, { executionPromise, waitForNextStop, snapshot });
+    this._startControlPoller(taskId, driver, executionPromise);
 
-    if (!wait) {
-      executionPromise.catch((err) => {
+    executionPromise
+      .then((finalSnap) => {
+        this.activeExecutions.delete(taskId);
+        this.saveSnapshot(finalSnap);
+      })
+      .catch((err) => {
+        this.activeExecutions.delete(taskId);
         snapshot.status = 'failed';
         snapshot.stopReason = 'error';
         snapshot.error = err.message || String(err);
         snapshot.diagnostic = formatDiagnosticSummary(snapshot);
         this.saveSnapshot(snapshot);
       });
+
+    if (!wait) {
       return snapshot;
     }
 
-    const finalSnapshot = await executionPromise;
-    this.saveSnapshot(finalSnapshot);
-    return finalSnapshot;
+    const finalOrAttentionSnapshot = await waitForNextStop(null);
+    this.saveSnapshot(finalOrAttentionSnapshot);
+    return finalOrAttentionSnapshot;
   }
 
   /**
@@ -416,15 +674,27 @@ export class TaskManager {
     const target = this.registry.getTargetOrThrow(snapshot.targetId);
     const driver = this.getDriver(target);
 
-    const finalSnapshot = await driver.runTurn(
+    const executionPromise = driver.runTurn(
       snapshot,
       { prompt, envVars, timeoutMs },
       (updated) => {
         this.saveSnapshot(updated);
       },
     );
-    this.saveSnapshot(finalSnapshot);
-    return finalSnapshot;
+    this.activeExecutions.set(taskId, {
+      executionPromise,
+      waitForNextStop: () => executionPromise,
+      snapshot,
+    });
+    this._startControlPoller(taskId, driver, executionPromise);
+
+    try {
+      const finalSnapshot = await executionPromise;
+      this.saveSnapshot(finalSnapshot);
+      return finalSnapshot;
+    } finally {
+      this.activeExecutions.delete(taskId);
+    }
   }
 
   /**
@@ -459,11 +729,73 @@ export class TaskManager {
     const target = this.registry.getTargetOrThrow(snapshot.targetId);
     const driver = this.getDriver(target);
 
-    const { handledLive, snapshot: steeredSnapshot } = await driver.steerLive(taskId, { action, message, snapshot });
+    const activeExec = this.activeExecutions.get(taskId);
+    const liveSnapshot = activeExec?.snapshot || snapshot;
+    const priorRequestId = liveSnapshot.attention?.requestId || null;
+    if (model) {
+      liveSnapshot.model = model;
+    }
+    if (effort) {
+      liveSnapshot.effort = effort;
+    }
+
+    const { handledLive, snapshot: steeredSnapshot } = await driver.steerLive(taskId, {
+      action,
+      message,
+      snapshot: liveSnapshot,
+      wait,
+    });
     if (handledLive) {
-      if (steeredSnapshot) {
-        this.saveSnapshot(steeredSnapshot);
-        return steeredSnapshot;
+      if (wait && activeExec) {
+        const stoppedSnap = await activeExec.waitForNextStop(priorRequestId);
+        this.saveSnapshot(stoppedSnap);
+        return stoppedSnap;
+      }
+      const latest = steeredSnapshot || this.getTask(taskId) || liveSnapshot;
+      this.saveSnapshot(latest);
+      return latest;
+    }
+
+    // Cross-process / cross-manager live steering when another owner has an active turn
+    if (
+      !this.activeExecutions.has(taskId) &&
+      snapshot.workerPid &&
+      this._isPidAlive(snapshot.workerPid) &&
+      (snapshot.status === 'attention_required' || snapshot.status === 'running')
+    ) {
+      const priorRequestId = snapshot.attention?.requestId || null;
+      const priorUpdatedAt = snapshot.metrics?.updatedAt || null;
+      const controlPath = this._controlPath(taskId);
+      fs.writeFileSync(
+        controlPath,
+        JSON.stringify({ id: crypto.randomUUID(), action, message, model, effort }, null, 2),
+        'utf8',
+      );
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 80));
+        const latest = this.getTask(taskId);
+        if (!latest) break;
+        if (!wait && !fs.existsSync(controlPath) && latest.metrics?.updatedAt !== priorUpdatedAt) {
+          return latest;
+        }
+        if (
+          latest.status === 'completed' ||
+          latest.status === 'failed' ||
+          latest.status === 'aborted'
+        ) {
+          return latest;
+        }
+        if (
+          latest.status === 'attention_required' &&
+          latest.attention?.requestId &&
+          latest.attention.requestId !== priorRequestId
+        ) {
+          return latest;
+        }
+        if (!this._isPidAlive(snapshot.workerPid)) {
+          return latest;
+        }
       }
       return this.getTask(taskId);
     }
@@ -481,6 +813,11 @@ export class TaskManager {
           `Task "${taskId}" does not have a resumable sessionId (sessionMode=${snapshot.sessionMode}).`,
         );
       }
+      if (snapshot.sessionTerminated) {
+        throw new Error(
+          `Task "${taskId}" session "${snapshot.sessionId}" was terminated via abort --kill and cannot be resumed.`,
+        );
+      }
       if (snapshot.sessionMode === 'ephemeral') {
         throw new Error(
           `Task "${taskId}" was created in ephemeral mode and its turn has already ended; use --persistent for multi-turn sessions.`,
@@ -490,6 +827,10 @@ export class TaskManager {
       const timeoutMs = (this.registry.config?.hub?.defaultTimeoutSec ?? 600) * 1000;
       const envVars = snapshot.trace
         ? {
+            H2H_TRACE_ID: snapshot.trace.traceId,
+            H2H_HOP_COUNT: String(snapshot.trace.hopCount),
+            H2H_MAX_HOPS: String(snapshot.trace.maxHops),
+            H2H_CALL_CHAIN: (snapshot.trace.callChain || []).join(','),
             REINS_TRACE_ID: snapshot.trace.traceId,
             REINS_HOP_COUNT: String(snapshot.trace.hopCount),
             REINS_MAX_HOPS: String(snapshot.trace.maxHops),
@@ -497,20 +838,87 @@ export class TaskManager {
           }
         : {};
 
+      snapshot.workerPid = process.pid;
+      snapshot.error = null;
+      delete snapshot.controlError;
+      this.saveSnapshot(snapshot);
+
+      const attentionWaiters = new Set();
+      const waitForNextStop = (ignoreRequestId = null) => {
+        if (
+          snapshot.status === 'attention_required' &&
+          (snapshot.attention?.requestId || null) !== ignoreRequestId
+        ) {
+          return Promise.resolve(snapshot);
+        }
+        if (
+          snapshot.status === 'completed' ||
+          snapshot.status === 'failed' ||
+          snapshot.status === 'aborted'
+        ) {
+          return Promise.resolve(snapshot);
+        }
+        return new Promise((resolve) => {
+          const waiter = (updated) => {
+            if (
+              updated.status === 'attention_required' &&
+              (updated.attention?.requestId || null) !== ignoreRequestId
+            ) {
+              attentionWaiters.delete(waiter);
+              resolve(updated);
+            }
+          };
+          attentionWaiters.add(waiter);
+          turnPromise.then(
+            (finalSnap) => {
+              attentionWaiters.delete(waiter);
+              resolve(finalSnap);
+            },
+            () => {
+              attentionWaiters.delete(waiter);
+              resolve(this.getTask(taskId) || snapshot);
+            },
+          );
+        });
+      };
+
       const turnPromise = driver.runTurn(
         snapshot,
         { prompt: message, envVars, timeoutMs },
         (updated) => {
           this.saveSnapshot(updated);
+          if (updated.status === 'attention_required') {
+            for (const waiter of [...attentionWaiters]) {
+              waiter(updated);
+            }
+          }
         },
       );
+      this.activeExecutions.set(taskId, {
+        executionPromise: turnPromise,
+        waitForNextStop,
+        snapshot,
+      });
+      this._startControlPoller(taskId, driver, turnPromise);
+      turnPromise
+        .then((finalSnap) => {
+          this.activeExecutions.delete(taskId);
+          this.saveSnapshot(finalSnap);
+        })
+        .catch((err) => {
+          this.activeExecutions.delete(taskId);
+          snapshot.status = 'failed';
+          snapshot.stopReason = 'error';
+          snapshot.error = err.message || String(err);
+          snapshot.diagnostic = formatDiagnosticSummary(snapshot);
+          this.saveSnapshot(snapshot);
+        });
 
       if (!wait) {
-        turnPromise.catch(() => {});
         return snapshot;
       }
 
-      const updated = await turnPromise;
+      const updated = await waitForNextStop(null);
       this.saveSnapshot(updated);
       return updated;
     }
@@ -524,30 +932,87 @@ export class TaskManager {
    * Aborts an active task and terminates its subprocess tree.
    *
    * @param {string} taskId
+   * @param {object} [options]
+   * @param {boolean} [options.terminateSession=false]
    * @returns {Promise<object>} Updated H2HTaskSnapshot
    */
-  async abort(taskId) {
-    const snapshot = this.getTask(taskId);
+  async abort(taskId, { terminateSession = false } = {}) {
+    const activeExec = this.activeExecutions.get(taskId);
+    const snapshot = activeExec?.snapshot || this.getTask(taskId);
     if (!snapshot) {
       throw new Error(`Unknown taskId "${taskId}".`);
     }
 
+    const isActiveTurn =
+      snapshot.status === 'running' ||
+      snapshot.status === 'queued' ||
+      snapshot.status === 'attention_required';
+    const hasRemoteOwner =
+      !activeExec &&
+      isActiveTurn &&
+      Boolean(snapshot.workerPid && this._isPidAlive(snapshot.workerPid));
+
     const target = this.registry.getTargetOrThrow(snapshot.targetId);
     const driver = this.getDriver(target);
-    const abortedInProcess = await driver.abort(taskId, snapshot);
+    let abortedInProcess = await driver.abort(taskId, snapshot, {
+      terminateSession,
+      hasRemoteOwner,
+    });
 
-    if (!abortedInProcess && snapshot.workerPid && snapshot.workerPid !== process.pid) {
-      if (process.platform === 'win32') {
-        spawnSync('taskkill.exe', ['/PID', String(snapshot.workerPid), '/T', '/F'], {
-          windowsHide: true,
-          stdio: 'ignore',
-        });
-      } else {
-        try {
-          process.kill(snapshot.workerPid, 'SIGTERM');
-        } catch {
-          // Ignore if already exited.
+    if (!abortedInProcess && hasRemoteOwner) {
+      const controlPath = this._controlPath(taskId);
+      const controlId = crypto.randomUUID();
+      delete snapshot.controlError;
+      delete snapshot.controlAckId;
+      this.saveSnapshot(snapshot);
+      fs.writeFileSync(
+        controlPath,
+        JSON.stringify(
+          { id: controlId, action: 'abort', terminateSession },
+          null,
+          2,
+        ),
+        'utf8',
+      );
+      const deadline = Date.now() + 6000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 40));
+        const latest = this.getTask(taskId);
+        if (latest && latest.controlAckId === controlId) {
+          delete latest.controlAckId;
+          if (latest.controlError) {
+            const errText = latest.controlError;
+            delete latest.controlError;
+            this.saveSnapshot(latest);
+            throw new Error(errText);
+          }
+          this.saveSnapshot(latest);
+          return latest;
         }
+        if (!this._isPidAlive(snapshot.workerPid)) {
+          abortedInProcess = true;
+          break;
+        }
+      }
+      if (snapshot.workerPid && snapshot.workerPid !== process.pid) {
+        if (process.platform === 'win32') {
+          spawnSync('taskkill.exe', ['/PID', String(snapshot.workerPid), '/T', '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          });
+        } else {
+          try {
+            process.kill(snapshot.workerPid, 'SIGTERM');
+          } catch {
+            // Ignore if already exited.
+          }
+        }
+      }
+      if (terminateSession && snapshot.sessionId && !snapshot.sessionTerminated) {
+        await driver.abort(taskId, snapshot, {
+          terminateSession: true,
+          hasRemoteOwner: false,
+        });
       }
     }
 

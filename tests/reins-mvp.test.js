@@ -11,10 +11,14 @@ import {
   applyPresetPrompt,
   buildResumeCommandHint,
   createInitialTaskSnapshot,
+  formatDiagnosticSummary,
+  H2H_PROTOCOL_ID,
   mapReinPolicyToCodex,
+  normalizeSnapshotEnvelope,
   REASONING_EFFORTS,
   resolveReinPolicy,
   resolveSessionMode,
+  truncateUtf8Bytes,
 } from '../src/protocol/schema.js';
 import { parseCliArgs } from '../src/cli/index.js';
 import { advanceTraceOrThrow } from '../src/hub/loop-guard.js';
@@ -25,8 +29,10 @@ import { AntigravityDriver } from '../src/drivers/antigravity-driver.js';
 import { DshDriver } from '../src/drivers/dsh-driver.js';
 import { ClaudeCodeDriver } from '../src/drivers/claude-code-driver.js';
 import {
+  CodexAppServerDriver,
   deriveCodexThreadTitle,
   normalizeCodexPath,
+  resolveGitWorktreeRoot,
   syncCodexDesktopCatalog,
 } from '../src/drivers/codex-app-server.js';
 import { DatabaseSync } from 'node:sqlite';
@@ -155,7 +161,7 @@ test('Antigravity driver handles persistent, resumed, and ephemeral turns', asyn
     });
     assert.equal(ephemeral.status, 'completed');
     assert.match(ephemeral.sessionId, /^agy_[0-9a-f-]+$/);
-    assert.equal(ephemeral.resumeCommandHint, undefined);
+    assert.equal(ephemeral.resumeCommandHint, null);
     const ephemeralArgs = JSON.parse(ephemeral.output).args;
     assert.ok(ephemeralArgs.includes('--ephemeral'));
     assert.ok(ephemeralArgs.includes('--read-only'));
@@ -848,7 +854,7 @@ test('TaskManager & ReinsMcpServer: end-to-end lifecycle with mock driver', asyn
     });
     const snapEph = JSON.parse(ephRes.result.content[0].text);
     assert.equal(snapEph.sessionMode, 'ephemeral');
-    assert.equal(snapEph.resumeCommandHint, undefined);
+    assert.equal(snapEph.resumeCommandHint, null);
   } finally {
     for (const key of traceKeys) {
       if (inheritedTrace[key] === undefined) delete process.env[key];
@@ -1114,6 +1120,303 @@ test('Model catalog and reasoning effort selection propagate across CLI, MCP, an
     for (const key of traceKeys) {
       if (inheritedTrace[key] === undefined) delete process.env[key];
       else process.env[key] = inheritedTrace[key];
+    }
+    fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
+});
+
+test('H2H Protocol v0.1 conformance invariants: project onboarding, UNC paths, UTF-8 byte cap, and H2H_* headers', async () => {
+  assert.equal(H2H_PROTOCOL_ID, 'h2h/v0.1');
+
+  // 1. UNC-safe Windows path canonicalization ([H2H-PROJ-05])
+  assert.equal(
+    normalizeCodexPath('\\\\?\\UNC\\server\\share\\repo'),
+    '\\\\server\\share\\repo',
+  );
+  assert.equal(
+    normalizeCodexPath('\\\\?\\C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol'),
+    'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol',
+  );
+
+  // 2. Git worktree root resolution from subdirectory ([H2H-PROJ-04])
+  const tempRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'h2h-git-root-'));
+  try {
+    fs.mkdirSync(path.join(tempRepo, '.git'), { recursive: true });
+    const subDir = path.join(tempRepo, 'spec', 'en');
+    fs.mkdirSync(subDir, { recursive: true });
+    assert.equal(
+      resolveGitWorktreeRoot(subDir).toLowerCase(),
+      normalizeCodexPath(tempRepo).toLowerCase(),
+    );
+  } finally {
+    fs.rmSync(tempRepo, { recursive: true, force: true });
+  }
+
+  // 3. UTF-8 byte-accurate truncation <= 4096 bytes ([H2H-SNAP-03])
+  const cjkError = '错误诊断信息'.repeat(1000); // 18,000 UTF-8 bytes (6,000 chars)
+  const snapWithCjk = createInitialTaskSnapshot({
+    taskId: 'tsk_utf8_test',
+    targetId: 'local-codex',
+    kind: 'codex',
+    sessionMode: 'ephemeral',
+    reinPolicy: 'auto-edit',
+    preset: 'task',
+    cwd: process.cwd(),
+  });
+  snapWithCjk.status = 'failed';
+  snapWithCjk.stopReason = 'error';
+  snapWithCjk.error = cjkError;
+  normalizeSnapshotEnvelope(snapWithCjk);
+  assert.ok(Buffer.byteLength(snapWithCjk.diagnostic, 'utf8') <= 4096);
+  assert.ok(Buffer.byteLength(truncateUtf8Bytes(cjkError, 512), 'utf8') <= 512);
+
+  // 4. H2H_* + REINS_* dual Loop Guard propagation and monotonic maxHops ([H2H-LOOP-01..03])
+  const hop1 = advanceTraceOrThrow({
+    targetId: 'local-codex',
+    env: {
+      H2H_TRACE_ID: 'trc_h2h_01',
+      H2H_HOP_COUNT: '1',
+      H2H_MAX_HOPS: '2',
+      H2H_CALL_CHAIN: 'local-agy',
+    },
+    configuredMaxHops: 5,
+  });
+  assert.equal(hop1.trace.traceId, 'trc_h2h_01');
+  assert.equal(hop1.trace.hopCount, 2);
+  assert.equal(hop1.trace.maxHops, 2);
+  assert.deepEqual(hop1.trace.callChain, ['local-agy', 'local-codex']);
+  assert.equal(hop1.envVars.H2H_TRACE_ID, 'trc_h2h_01');
+  assert.equal(hop1.envVars.H2H_HOP_COUNT, '2');
+  assert.equal(hop1.envVars.H2H_MAX_HOPS, '2');
+  assert.equal(hop1.envVars.H2H_CALL_CHAIN, 'local-agy,local-codex');
+
+  // 5. Pending Codex snapshot preserves null project.root so subdirectory cwd resolves to Git root
+  const pendingCodexSnap = createInitialTaskSnapshot({
+    taskId: 'tsk_pending_root',
+    targetId: 'local-codex',
+    kind: 'codex',
+    sessionMode: 'persistent',
+    reinPolicy: 'auto-edit',
+    preset: 'task',
+    cwd: 'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol\\spec\\en',
+  });
+  normalizeSnapshotEnvelope(pendingCodexSnap);
+  assert.equal(pendingCodexSnap.project.root, null);
+  assert.equal(pendingCodexSnap.projectSelector, undefined);
+
+  // 6. Strict auto-edit approval confinement ([H2H-POL-02])
+  const codexDriver = new CodexAppServerDriver({ id: 'local-codex', kind: 'codex' });
+  const mockRuntime = {
+    effectiveProjectRoot: 'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol',
+    snapshot: pendingCodexSnap,
+  };
+  assert.equal(
+    codexDriver._isWithinWorkspaceForAutoEdit(
+      mockRuntime,
+      'item/commandExecution/requestApproval',
+      { command: 'rm -rf /tmp/outside', cwd: 'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol' },
+    ),
+    false,
+  );
+  assert.equal(
+    codexDriver._isWithinWorkspaceForAutoEdit(
+      mockRuntime,
+      'item/fileChange/requestApproval',
+      {},
+    ),
+    false,
+  );
+  assert.equal(
+    codexDriver._isWithinWorkspaceForAutoEdit(
+      mockRuntime,
+      'item/fileChange/requestApproval',
+      { changes: [{ path: 'README.md' }] },
+    ),
+    true,
+  );
+  assert.equal(
+    codexDriver._isWithinWorkspaceForAutoEdit(
+      mockRuntime,
+      'item/fileChange/requestApproval',
+      { changes: [{ path: '..\\outside.txt' }] },
+    ),
+    false,
+  );
+
+  // 7. Foreground wait returns immediately on attention_required and steer(approve) completes ([H2H-PRIM-03])
+  const tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-attn-test-'));
+  const traceKeys = [
+    'H2H_TRACE_ID',
+    'H2H_HOP_COUNT',
+    'H2H_MAX_HOPS',
+    'H2H_CALL_CHAIN',
+    'REINS_TRACE_ID',
+    'REINS_HOP_COUNT',
+    'REINS_MAX_HOPS',
+    'REINS_CALL_CHAIN',
+  ];
+  const savedEnv = Object.fromEntries(traceKeys.map((k) => [k, process.env[k]]));
+  for (const k of traceKeys) delete process.env[k];
+  try {
+    let resumeGate = null;
+    const gateDriver = {
+      async runTurn(snapshot, _opts, onUpdate) {
+        snapshot.sessionId = 'thr_attn_01';
+        snapshot.project = {
+          id: 'proj_attn_01',
+          root: snapshot.cwd,
+          binding: 'bound',
+          mechanism: 'native-id',
+        };
+        snapshot.status = 'attention_required';
+        snapshot.stopReason = 'attention-required';
+        snapshot.attention = {
+          requestId: 'req_1',
+          method: 'item/commandExecution/requestApproval',
+          summary: 'Approve command',
+          createdAt: new Date().toISOString(),
+        };
+        onUpdate(snapshot);
+        const approved = await new Promise((resolve) => {
+          resumeGate = resolve;
+        });
+        snapshot.attention = undefined;
+        snapshot.status = 'completed';
+        snapshot.stopReason = 'end_turn';
+        snapshot.output = approved ? 'Approved and completed' : 'Declined';
+        onUpdate(snapshot);
+        return snapshot;
+      },
+      async steerLive(_taskId, { action, snapshot }) {
+        if (resumeGate && (action === 'approve' || action === 'reject')) {
+          resumeGate(action === 'approve');
+          await new Promise((r) => setTimeout(r, 20));
+          return { handledLive: true, snapshot };
+        }
+        return { handledLive: false };
+      },
+      async abort(_taskId, snapshot, { terminateSession = false } = {}) {
+        if (terminateSession && snapshot) {
+          snapshot.resumeCommandHint = null;
+          snapshot.sessionTerminated = true;
+        }
+        return true;
+      },
+    };
+
+    const tm = new TaskManager({
+      stateDir: tempStateDir,
+      driverOverrides: { 'codex-app-server': gateDriver },
+    });
+
+    const pausedSnap = await tm.delegate({
+      targetId: 'local-codex',
+      prompt: 'Run privileged tool',
+      reinPolicy: 'parent-rein',
+      wait: true,
+    });
+    assert.equal(pausedSnap.status, 'attention_required');
+    assert.equal(pausedSnap.stopReason, 'attention-required');
+
+    const completedSnap = await tm.steer(pausedSnap.taskId, {
+      action: 'approve',
+      wait: true,
+    });
+    assert.equal(completedSnap.status, 'completed');
+    assert.equal(completedSnap.output, 'Approved and completed');
+
+    const killedSnap = await tm.abort(pausedSnap.taskId, { terminateSession: true });
+    assert.equal(killedSnap.status, 'aborted');
+    assert.equal(killedSnap.resumeCommandHint, null);
+    assert.equal(killedSnap.sessionTerminated, true);
+
+    // 8. Cross-manager abort --kill waits for controlAckId when turn/interrupt finishes before delayed thread/archive failure
+    const targetCfg = { id: 'probe', kind: 'codex', driver: 'codex-app-server' };
+    const mockRegistry = { getTargetOrThrow: () => targetCfg, config: { hub: {} } };
+    const ownerDriver = new CodexAppServerDriver(targetCfg);
+    const peerDriver = new CodexAppServerDriver(targetCfg);
+    peerDriver._archiveSessionViaNewTransport = async () => {
+      throw new Error('unexpected fallback');
+    };
+    let archiveSettled = false;
+    let releaseTurn;
+    ownerDriver.runTurn = async (s, _opts, onUpdate) => {
+      s.status = 'attention_required';
+      s.stopReason = 'attention-required';
+      s.attention = { requestId: 'req_ack_1' };
+      const turn = new Promise((resolve) => {
+        releaseTurn = () => resolve(s);
+      });
+      ownerDriver.activeSessions.set(s.taskId, {
+        snapshot: s,
+        threadId: s.sessionId,
+        activeTurnId: 'turn_ack_1',
+        transport: {
+          request: async (method) => {
+            if (method === 'turn/interrupt') {
+              s.status = 'aborted';
+              s.stopReason = 'aborted';
+              onUpdate(s);
+              return {};
+            }
+            if (method === 'thread/archive') {
+              await new Promise((r) => setTimeout(r, 120));
+              archiveSettled = true;
+              throw new Error('mock archive denied');
+            }
+            return {};
+          },
+          close: async () => releaseTurn?.(),
+        },
+      });
+      onUpdate(s);
+      await turn;
+      ownerDriver.activeSessions.delete(s.taskId);
+      return s;
+    };
+
+    const ownerTm = new TaskManager({
+      registry: mockRegistry,
+      stateDir: tempStateDir,
+      driverOverrides: { probe: ownerDriver },
+    });
+    const peerTm = new TaskManager({
+      registry: mockRegistry,
+      stateDir: tempStateDir,
+      driverOverrides: { probe: peerDriver },
+    });
+
+    const ackSnap = createInitialTaskSnapshot({
+      taskId: 'tsk_archive_ack_probe',
+      targetId: 'probe',
+      kind: 'codex',
+      sessionMode: 'persistent',
+      reinPolicy: 'parent-rein',
+      preset: 'task',
+      cwd: process.cwd(),
+      sessionId: 'thr_native_ack',
+    });
+    ackSnap.status = 'completed';
+    ackSnap.stopReason = 'end_turn';
+    ackSnap.project = {
+      id: 'proj_ack_A',
+      root: process.cwd(),
+      binding: 'bound',
+      mechanism: 'native-id',
+    };
+    ownerTm.saveSnapshot(ackSnap);
+    await ownerTm.steer(ackSnap.taskId, { action: 'reply', message: 'resume', wait: true });
+
+    await assert.rejects(
+      peerTm.abort(ackSnap.taskId, { terminateSession: true }),
+      /mock archive denied/,
+    );
+    assert.equal(archiveSettled, true);
+    assert.equal(peerTm.getTask(ackSnap.taskId)?.sessionTerminated ?? false, false);
+  } finally {
+    for (const k of traceKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
     }
     fs.rmSync(tempStateDir, { recursive: true, force: true });
   }

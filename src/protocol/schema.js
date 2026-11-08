@@ -5,7 +5,8 @@
  * resolvers, and diagnostic formatters defined in docs/H2H_PROTOCOL.md.
  */
 
-export const H2H_PROTOCOL_VERSION = '0.2.0';
+export const H2H_PROTOCOL_ID = 'h2h/v0.1';
+export const H2H_PROTOCOL_VERSION = '0.1.0';
 
 export const HARNESS_KINDS = Object.freeze([
   'claude-code',
@@ -134,7 +135,7 @@ export function mapReinPolicyToCodex(reinPolicy) {
     case 'free-rein':
       return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
     case 'auto-edit':
-      return { approvalPolicy: 'never', sandbox: 'workspace-write' };
+      return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
     case 'parent-rein':
       return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
     case 'tight-rein':
@@ -247,20 +248,54 @@ export function buildResumeCommandHint({
   return baseCmd;
 }
 
+export const MAX_DIAGNOSTIC_UTF8_BYTES = 4096;
+
+/**
+ * Truncates a string so its UTF-8 byte length does not exceed `maxBytes`.
+ *
+ * @param {string} text
+ * @param {number} [maxBytes=MAX_DIAGNOSTIC_UTF8_BYTES]
+ * @returns {string}
+ */
+export function truncateUtf8Bytes(text, maxBytes = MAX_DIAGNOSTIC_UTF8_BYTES) {
+  const str = String(text ?? '');
+  if (Buffer.byteLength(str, 'utf8') <= maxBytes) {
+    return str;
+  }
+  const suffix = '...';
+  const targetBytes = Math.max(0, maxBytes - Buffer.byteLength(suffix, 'utf8'));
+  let buf = Buffer.from(str, 'utf8').subarray(0, targetBytes);
+  // Trim any incomplete multi-byte UTF-8 sequence at the tail
+  while (buf.length > 0 && (buf[buf.length - 1] & 0b11000000) === 0b10000000) {
+    buf = buf.subarray(0, buf.length - 1);
+  }
+  if (buf.length > 0 && (buf[buf.length - 1] & 0b10000000) !== 0) {
+    buf = buf.subarray(0, buf.length - 1);
+  }
+  return `${buf.toString('utf8')}${suffix}`;
+}
+
 /**
  * Formats a safe, structured diagnostic summary suitable for logs and parent-agent inspection
- * without leaking full prompt/transcript payloads.
+ * without leaking full prompt/transcript payloads, bounded to 4,096 UTF-8 bytes.
  *
  * @param {object} snapshot
  * @returns {string}
  */
 export function formatDiagnosticSummary(snapshot) {
+  const targetKind = snapshot.targetKind || snapshot.kind || 'unknown';
   const parts = [
     `taskId=${snapshot.taskId}`,
-    `target=${snapshot.targetId}(${snapshot.kind})`,
+    `target=${snapshot.targetId}(${targetKind})`,
     `status=${snapshot.status}`,
     `mode=${snapshot.sessionMode}`,
   ];
+  if (snapshot.project?.binding) {
+    parts.push(`projectBinding=${snapshot.project.binding}`);
+  }
+  if (snapshot.project?.id) {
+    parts.push(`projectId=${snapshot.project.id}`);
+  }
   if (snapshot.model) {
     parts.push(`model=${snapshot.model}`);
   }
@@ -277,16 +312,16 @@ export function formatDiagnosticSummary(snapshot) {
     parts.push(`durationMs=${snapshot.metrics.durationMs}`);
   }
   if (snapshot.error) {
-    parts.push(`error=${ JSON.stringify(String(snapshot.error).slice(0, 240)) }`);
+    parts.push(`error=${JSON.stringify(String(snapshot.error).slice(0, 240))}`);
   }
   if (snapshot.resumeCommandHint) {
-    parts.push(`resume=${ JSON.stringify(snapshot.resumeCommandHint) }`);
+    parts.push(`resume=${JSON.stringify(snapshot.resumeCommandHint)}`);
   }
-  return `[Reins H2H] ${parts.join(' | ')}`;
+  return truncateUtf8Bytes(`[Reins H2H] ${parts.join(' | ')}`, MAX_DIAGNOSTIC_UTF8_BYTES);
 }
 
 /**
- * Creates a fresh H2HTaskSnapshot object adhering to H2H Protocol v0.2.
+ * Creates a fresh H2HTaskSnapshot object adhering to H2H Protocol v0.1.
  *
  * @param {object} params
  * @returns {object}
@@ -299,6 +334,7 @@ export function createInitialTaskSnapshot({
   reinPolicy = 'parent-rein',
   preset = 'task',
   cwd,
+  project,
   model,
   effort,
   sessionId,
@@ -307,30 +343,55 @@ export function createInitialTaskSnapshot({
   trace,
 }) {
   const now = new Date().toISOString();
+  const resumeHint = buildResumeCommandHint({
+    kind,
+    sessionId,
+    sessionMode,
+    transportType,
+    sshHost,
+  });
+  const defaultBinding = sessionMode === 'ephemeral' ? 'not-required' : 'pending';
+  const defaultMechanism =
+    sessionMode === 'ephemeral'
+      ? null
+      : kind === 'codex'
+        ? 'native-id'
+        : 'native-path';
+
   const snapshot = {
+    protocol: H2H_PROTOCOL_ID,
     protocolVersion: H2H_PROTOCOL_VERSION,
     taskId,
     targetId,
     kind,
-    sessionId: sessionId || undefined,
+    targetKind: kind,
+    sessionId: sessionId || null,
     sessionMode,
     reinPolicy,
     preset,
     cwd,
-    model: model || undefined,
-    effort: effort || undefined,
-    resumeCommandHint: buildResumeCommandHint({
-      kind,
-      sessionId,
-      sessionMode,
-      transportType,
-      sshHost,
-    }),
+    ...(project?.id || project?.root
+      ? {
+          projectSelector: {
+            ...(project.id ? { id: project.id } : {}),
+            ...(project.root ? { root: project.root } : {}),
+          },
+        }
+      : {}),
+    project: {
+      id: project?.id ?? null,
+      root: project?.root ?? null,
+      binding: project?.binding ?? defaultBinding,
+      mechanism: project?.mechanism !== undefined ? project.mechanism : defaultMechanism,
+    },
+    model: model || null,
+    effort: effort || null,
+    resumeCommandHint: resumeHint || null,
     status: 'queued',
-    stopReason: undefined,
+    stopReason: null,
     output: '',
     commentary: '',
-    error: undefined,
+    error: null,
     diagnostic: '',
     attention: undefined,
     transcript: {
@@ -339,6 +400,7 @@ export function createInitialTaskSnapshot({
       messages: [],
     },
     metrics: {
+      createdAt: now,
       startedAt: now,
       updatedAt: now,
       durationMs: 0,
@@ -348,6 +410,73 @@ export function createInitialTaskSnapshot({
     },
     trace: trace || undefined,
   };
+  snapshot.diagnostic = formatDiagnosticSummary(snapshot);
+  return snapshot;
+}
+
+/**
+ * Normalizes a mutable H2HTaskSnapshot in-place so all required nullable fields
+ * and project-binding invariants conform to `schema/h2h-v0.1.schema.json`.
+ *
+ * @param {object} snapshot
+ * @returns {object}
+ */
+export function normalizeSnapshotEnvelope(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return snapshot;
+  snapshot.protocol = snapshot.protocol || H2H_PROTOCOL_ID;
+  snapshot.protocolVersion = snapshot.protocolVersion || H2H_PROTOCOL_VERSION;
+  snapshot.targetKind = snapshot.targetKind || snapshot.kind || 'unknown';
+  snapshot.kind = snapshot.kind || snapshot.targetKind;
+  snapshot.sessionId = snapshot.sessionId ?? null;
+  snapshot.model = snapshot.model ?? null;
+  snapshot.effort = snapshot.effort ?? null;
+  snapshot.resumeCommandHint = snapshot.resumeCommandHint ?? null;
+  snapshot.stopReason = snapshot.stopReason ?? null;
+  snapshot.error = snapshot.error ?? null;
+  snapshot.output = typeof snapshot.output === 'string' ? snapshot.output : String(snapshot.output ?? '');
+
+  if (!snapshot.project || typeof snapshot.project !== 'object') {
+    snapshot.project = {
+      id: null,
+      root: snapshot.kind === 'codex' ? null : snapshot.cwd || null,
+      binding: snapshot.sessionMode === 'ephemeral' ? 'not-required' : 'pending',
+      mechanism:
+        snapshot.sessionMode === 'ephemeral'
+          ? null
+          : snapshot.kind === 'codex'
+            ? 'native-id'
+            : 'native-path',
+    };
+  } else {
+    snapshot.project.id = snapshot.project.id ?? null;
+    snapshot.project.root =
+      snapshot.project.root ??
+      (snapshot.kind === 'codex' && snapshot.project.binding === 'pending'
+        ? null
+        : snapshot.cwd || null);
+    if (snapshot.sessionMode === 'ephemeral') {
+      snapshot.project.id = null;
+      snapshot.project.binding = 'not-required';
+      snapshot.project.mechanism = null;
+    } else if (
+      snapshot.kind !== 'codex' &&
+      snapshot.project.binding === 'pending' &&
+      snapshot.sessionId &&
+      (snapshot.status === 'running' ||
+        snapshot.status === 'completed' ||
+        snapshot.status === 'attention_required')
+    ) {
+      snapshot.project.binding = 'bound';
+      snapshot.project.mechanism = snapshot.project.mechanism || 'native-path';
+    }
+  }
+
+  if (snapshot.metrics && typeof snapshot.metrics === 'object') {
+    snapshot.metrics.createdAt =
+      snapshot.metrics.createdAt || snapshot.metrics.startedAt || new Date().toISOString();
+    snapshot.metrics.startedAt = snapshot.metrics.startedAt || snapshot.metrics.createdAt;
+  }
+
   snapshot.diagnostic = formatDiagnosticSummary(snapshot);
   return snapshot;
 }

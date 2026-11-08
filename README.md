@@ -1,7 +1,7 @@
 # Reins
 
 > **Take the reins of all your local and remote AI coding harnesses.**  
-> Cross-host AI Coding Harness Interop Gateway (H2H Protocol via MCP & CLI/Skill) and Mobile Command Center.
+> Official Reference Gateway & Mobile Command Center for the [**H2H (Harness-to-Harness) Protocol v0.1**](https://github.com/Satone7/h2h-protocol) (via MCP & CLI/Skill).
 
 ---
 
@@ -10,8 +10,9 @@
 In AI software engineering, tools such as OpenAI Codex, Antigravity (`agy`), DeepSeek Harness (`dsh`), and Claude Code are known as **Harnesses**.  
 However, when multiple horses wearing different harnesses pull the same carriage without unified **reins** in the driver's hands, they operate in isolated silos and cannot collaborate.
 
-**Reins** is the unified control plane that connects them:
-- **Pass / Hand over the reins**: Let any host Harness (e.g., Antigravity or Claude Code) dynamically delegate subtasks to another local or remote Harness (e.g., local `codex`, `dsh`, or remote `claude-code` over SSH) via the standardized **H2H (Harness-to-Harness) Protocol** exposed through both **MCP** and **CLI + Agent Skill (`SKILL.md`)**.
+**Reins** is the unified control plane and reference implementation of the open [**H2H Protocol (`Satone7/h2h-protocol`)**](https://github.com/Satone7/h2h-protocol) that connects them:
+- **Pass / Hand over the reins**: Let any host Harness (e.g., Antigravity or Claude Code) dynamically onboard a project and delegate subtasks to another local or remote Harness (e.g., local `codex`, `dsh`, or remote `claude-code` over SSH) via the standardized [**H2H (Harness-to-Harness) Protocol**](https://github.com/Satone7/h2h-protocol) exposed through both **MCP** and **CLI + Agent Skill (`SKILL.md`)**.
+- **Onboard projects & bind conversations**: Automatically canonicalize paths, pre-authorize workspace trust, register the repository as a first-class Project in the target Harness (e.g., Codex `project/list` $\rightarrow$ `project/create`), and bind conversations directly under that project (`snapshot.project.binding = "bound"`) so the target Harness can actively inspect repository files and human developers see the session grouped under the project in the native UI.
 - **Take the reins**: Inspect live progress, transcripts, and diffs from your terminal or mobile device at any time, and seamlessly resume H2H-created sessions directly inside each target Harness's native UI/CLI.
 - **Free rein vs. Tight rein**: Configure sandboxed autonomous execution (`free-rein`, `auto-edit`), route permission prompts back to the parent Harness (`parent-rein`), or intercept high-risk actions and push interactive approval cards to your mobile phone (`tight-rein`).
 - **Pull the reins**: Instantly interrupt a runaway turn (`reins abort`) while keeping the underlying session alive for follow-up steering.
@@ -74,8 +75,11 @@ reins/
 
 ## 4. Quick Navigation (For Coding Agents)
 
+> **Standalone Protocol Specification Repository**:  
+> The vendor-neutral, bilingual (EN / 简体中文) H2H Protocol Specification and living Harness capability registry is maintained at **[`github.com/Satone7/h2h-protocol`](https://github.com/Satone7/h2h-protocol)** (local sibling workspace: `../h2h-protocol`).
+
 When working on this repository in a new session, read the core documents in the following order:
-1. **[`research/PROTOCOLS_AND_ECOSYSTEM.md`](./research/PROTOCOLS_AND_ECOSYSTEM.md)**: Understand the boundaries of existing protocols (MCP Tasks, A2A, ACP, AHP), how OpenAI's `codex-plugin-cc` and DSH's `@deepseek-ai/dsh-subagent*` work under the hood, and how Reins bridges their gaps.
-2. **[`docs/H2H_PROTOCOL.md`](./docs/H2H_PROTOCOL.md)**: Review the H2H v0.2 primitives, dual session lifecycle (`persistent` vs. `ephemeral`), `ReinPolicy` permission matrix, workspace handoff contracts, loop guard headers, and isomorphic MCP/CLI schemas.
+1. **[`Satone7/h2h-protocol`](https://github.com/Satone7/h2h-protocol)** & **[`research/PROTOCOLS_AND_ECOSYSTEM.md`](./research/PROTOCOLS_AND_ECOSYSTEM.md)**: Understand the boundaries of existing protocols (MCP Tasks, A2A, ACP, AHP), how OpenAI's `codex-plugin-cc` and DSH's `@deepseek-ai/dsh-subagent*` work under the hood, and how H2H bridges their gaps.
+2. **[`docs/H2H_PROTOCOL.md`](./docs/H2H_PROTOCOL.md)**: Review Reins' implementation of the H2H v0.1 primitives, Project Onboarding & Session Binding contract (`snapshot.project`), dual session lifecycle (`persistent` vs. `ephemeral`), `ReinPolicy` permission matrix, loop guard headers (`H2H_*` / `REINS_*`), and isomorphic MCP/CLI schemas.
 3. **[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**: Review the module boundaries and the adaptation sequence (`codex` $\rightarrow$ `antigravity` $\rightarrow$ `dsh` $\rightarrow$ `claudecode`).
 4. **[`config/reins.example.yaml`](./config/reins.example.yaml)**: Check target and policy configuration formats.

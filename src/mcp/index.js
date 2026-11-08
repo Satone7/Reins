@@ -84,6 +84,21 @@ export const MCP_TOOLS = Object.freeze([
           type: 'string',
           description: 'Working directory on the target host.',
         },
+        project: {
+          type: 'object',
+          description: 'Optional Project Onboarding & Session Binding selector.',
+          properties: {
+            id: {
+              type: 'string',
+              description: 'Explicit native project ID in the target Harness.',
+            },
+            root: {
+              type: 'string',
+              description: 'Explicit project root directory on the target host.',
+            },
+          },
+          additionalProperties: false,
+        },
         model: {
           type: 'string',
           description: 'Optional model override (e.g., "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna").',
@@ -100,6 +115,14 @@ export const MCP_TOOLS = Object.freeze([
         timeoutSec: {
           type: 'number',
           description: 'Maximum turn duration in seconds (default: 600).',
+        },
+        allowTargetReentry: {
+          type: 'boolean',
+          description: 'If true, allow intentional ping-pong re-entry to a target already in the call chain (still bounded by maxHops).',
+        },
+        trace: {
+          type: 'object',
+          description: 'Optional Loop Guard trace context propagated from parent Harness.',
         },
       },
       additionalProperties: false,
@@ -182,6 +205,10 @@ export const MCP_TOOLS = Object.freeze([
         taskId: {
           type: 'string',
           description: 'Task ID to abort.',
+        },
+        terminateSession: {
+          type: 'boolean',
+          description: 'If true, also destroy any persistent tmux/daemon session hosting the task.',
         },
       },
       additionalProperties: false,
@@ -337,10 +364,13 @@ export class ReinsMcpServer {
           reinPolicy: args.reinPolicy,
           sessionId: args.sessionId,
           cwd: args.cwd,
+          project: args.project,
           model: args.model,
           effort: args.effort,
           wait: args.wait ?? true,
           timeoutSec: args.timeoutSec,
+          trace: args.trace,
+          allowTargetReentry: Boolean(args.allowTargetReentry),
         });
         return {
           content: [
@@ -403,7 +433,9 @@ export class ReinsMcpServer {
       }
 
       if (name === 'reins_abort') {
-        const snapshot = await this.taskManager.abort(args.taskId);
+        const snapshot = await this.taskManager.abort(args.taskId, {
+          terminateSession: Boolean(args.terminateSession),
+        });
         return {
           content: [
             {

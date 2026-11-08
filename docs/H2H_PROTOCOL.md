@@ -1,7 +1,8 @@
-# Reins H2H (Harness-to-Harness) Protocol Specification v0.2
+# Reins — H2H (Harness-to-Harness) Protocol Implementation Architecture (`h2h/v0.1`)
 
-> **Status**: Draft v0.2 (Aligned with OpenAI `codex-plugin-cc` / `codex app-server`, DeepSeek Harness `@deepseek-ai/dsh-subagent*`, ACP, and `dsh-claude-vps`)  
-> **Scope**: Defines the standardized protocol for capability discovery, task delegation, multi-turn steering/resumption, interactive permission governance, and mobile notification synchronization across local and remote AI Coding Harnesses via **Reins Hub**.
+> **Canonical Open Specification**: [**`github.com/Satone7/h2h-protocol`**](https://github.com/Satone7/h2h-protocol) (`h2h/v0.1`, bilingual EN / 简体中文)  
+> **Status**: v0.1 Reference Implementation (Aligned with OpenAI `codex-plugin-cc` / `codex app-server`, DeepSeek Harness `@deepseek-ai/dsh-subagent*`, ACP, and `dsh-claude-vps`)  
+> **Scope**: Defines how **Reins** implements the [H2H Protocol v0.1](https://github.com/Satone7/h2h-protocol) for capability discovery, project onboarding & session binding (`snapshot.project`), task delegation, multi-turn steering/resumption, interactive permission governance, and mobile notification synchronization across local and remote AI Coding Harnesses.
 
 ---
 
@@ -357,16 +358,16 @@ Reins decouples the **Transport Layer (`LocalTransport` vs. `SshTransport`)** fr
 
 ## 7. Call-Chain Loop Guard & Workspace Handoff Contract
 
-### 7.1 Call-Chain Loop Guard (`REINS_*` Environment Headers)
-When spawning local subprocesses or remote SSH commands, Reins injects:
-- `REINS_TRACE_ID`: Global trace identifier (e.g., `tr_01j9x8k2m`)
-- `REINS_HOP_COUNT`: Current delegation depth (root call is `1`, incremented by `+1` on each hop)
-- `REINS_MAX_HOPS`: Maximum allowed hop count (default `3`)
-- `REINS_CALL_CHAIN`: Comma-delimited list of visited target IDs (e.g., `antigravity@local,local-codex`)
+### 7.1 Call-Chain Loop Guard (`H2H_*` & `REINS_*` Environment Headers)
+When spawning local subprocesses or remote SSH commands, Reins reads `H2H_*` (falling back to `REINS_*`) and injects both standard and legacy headers:
+- `H2H_TRACE_ID` (`REINS_TRACE_ID`): Global trace identifier (e.g., `tr_01j9x8k2m`)
+- `H2H_HOP_COUNT` (`REINS_HOP_COUNT`): Current delegation depth (`parentHop = incoming ?? 0`, `childHop = parentHop + 1`)
+- `H2H_MAX_HOPS` (`REINS_MAX_HOPS`): Maximum allowed hop count (default `3`; monotonic ceiling `min(requested, inherited)`)
+- `H2H_CALL_CHAIN` (`REINS_CALL_CHAIN`): Comma-delimited list of visited target IDs (e.g., `local-agy,local-codex`)
 
 **Enforcement Rules**:
-1. If `REINS_HOP_COUNT >= REINS_MAX_HOPS`, `reins_delegate` rejects immediately with `stopReason: 'error'` and diagnostic category `depth-limit`.
-2. If `target` is already present in `REINS_CALL_CHAIN` and `allowLoopback: true` is not explicitly set, `reins_delegate` blocks the cyclic call.
+1. If `childHop > effectiveMaxHops`, `reins_delegate` rejects immediately with `stopReason: 'error'` and diagnostic category `depth-limit`.
+2. If `target` is already present in `CALL_CHAIN` and `allowTargetReentry: true` is not explicitly set, `reins_delegate` blocks the cyclic call.
 
 ### 7.2 Cross-Host Workspace Modes (`workspaceMode`)
 1. **`remote-native` (Default)**: Executes directly inside `workdir` on the target host.

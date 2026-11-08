@@ -147,18 +147,27 @@ export async function notifyCodexDesktopIpc({ threadId, codexHome, timeoutMs = 1
         if (msg?.type === 'response' && msg?.requestId === initRequestId) {
           const clientId = msg?.result?.clientId || 'reins-h2h-client';
           try {
-            socket.write(
-              encodeCodexIpcFrame({
-                type: 'broadcast',
-                method: 'thread-unarchived',
-                sourceClientId: clientId,
-                params: {
-                  hostId: 'local',
-                  conversationId: threadId,
-                },
-                version: 1,
-              }),
-              () => finish(true, socket),
+            const unarchiveFrame = encodeCodexIpcFrame({
+              type: 'broadcast',
+              method: 'thread-unarchived',
+              sourceClientId: clientId,
+              params: {
+                hostId: 'local',
+                conversationId: threadId,
+              },
+              version: 1,
+            });
+            const invalidateFrame = encodeCodexIpcFrame({
+              type: 'broadcast',
+              method: 'query-cache-invalidate',
+              sourceClientId: clientId,
+              params: {
+                queryKey: [],
+              },
+              version: 1,
+            });
+            socket.write(Buffer.concat([unarchiveFrame, invalidateFrame]), () =>
+              finish(true, socket),
             );
           } catch {
             finish(false, socket);
@@ -171,18 +180,48 @@ export async function notifyCodexDesktopIpc({ threadId, codexHome, timeoutMs = 1
 }
 
 /**
- * Strips the Windows extended-length path prefix (`\\?\`) produced by Rust `std::fs::canonicalize`
- * so paths match Codex Desktop's Electron path normalization (`C:\...`).
+ * Strips the Windows extended-length path prefix (`\\?\` and `\\?\UNC\`) produced by
+ * Rust `std::fs::canonicalize` so paths match Codex Desktop's Electron path normalization.
  *
  * @param {string} rawPath
  * @returns {string}
  */
 export function normalizeCodexPath(rawPath) {
-  return String(rawPath || '').replace(/^\\\\\?\\/, '');
+  return String(rawPath || '')
+    .replace(/^\\\\\?\\UNC\\/i, '\\\\')
+    .replace(/^\\\\\?\\/, '');
 }
 
 /**
- * Checks whether a workspace path is already registered in Codex Desktop's `local-projects`.
+ * Resolves the containing Git worktree root for a local path by walking up parent
+ * directories looking for a `.git` directory or linked-worktree `.git` file.
+ * Falls back to the normalized `targetCwd` when not inside a Git checkout.
+ *
+ * @param {string} targetCwd
+ * @returns {string}
+ */
+export function resolveGitWorktreeRoot(targetCwd) {
+  const resolved = normalizeCodexPath(path.resolve(normalizeCodexPath(targetCwd || process.cwd())));
+  let current = resolved;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(current, '.git'))) {
+        return current;
+      }
+    } catch {
+      // Ignore permission errors while walking up.
+    }
+    const parent = path.dirname(current);
+    if (!parent || parent === current) {
+      return resolved;
+    }
+    current = parent;
+  }
+}
+
+/**
+ * Checks whether a workspace path is already registered in Codex Desktop's `local-projects`,
+ * selecting the most specific (longest) matching project root.
  *
  * @param {Record<string, any>} localProjects
  * @param {string} targetCwd
@@ -191,16 +230,21 @@ export function normalizeCodexPath(rawPath) {
 function findMatchingCodexProjectId(localProjects, targetCwd) {
   if (!localProjects || typeof localProjects !== 'object' || !targetCwd) return null;
   const normTarget = path.resolve(normalizeCodexPath(targetCwd)).replace(/[\\/]+$/, '').toLowerCase();
+  let bestId = null;
+  let bestLen = -1;
   for (const [projectId, proj] of Object.entries(localProjects)) {
     const roots = Array.isArray(proj?.rootPaths) ? proj.rootPaths : [];
     for (const root of roots) {
       const normRoot = path.resolve(normalizeCodexPath(root)).replace(/[\\/]+$/, '').toLowerCase();
       if (normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`)) {
-        return projectId;
+        if (normRoot.length > bestLen) {
+          bestLen = normRoot.length;
+          bestId = projectId;
+        }
       }
     }
   }
-  return null;
+  return bestId;
 }
 
 /**
@@ -250,6 +294,7 @@ export async function syncCodexDesktopCatalog({
   threadId,
   cwd,
   title,
+  projectId = null,
   codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
   notifyRunningDesktop = true,
 }) {
@@ -257,6 +302,7 @@ export async function syncCodexDesktopCatalog({
     syncedStateDb: false,
     syncedCatalogDb: false,
     ipcNotified: false,
+    projectId: projectId || null,
   };
   if (!threadId || !codexHome) return result;
 
@@ -266,7 +312,7 @@ export async function syncCodexDesktopCatalog({
   let threadRow = null;
 
   // 1. Update `~/.codex/state_5.sqlite` (`threads` table and `project_roots` lookup)
-  let serverProjectId = null;
+  let serverProjectId = projectId || null;
   const stateDbPath = path.join(codexHome, 'state_5.sqlite');
   if (fs.existsSync(stateDbPath)) {
     let stateDb = null;
@@ -284,15 +330,38 @@ export async function syncCodexDesktopCatalog({
           .prepare(`SELECT project_id, path FROM project_roots`)
           .all();
         const normTarget = path.resolve(normalizedCwd).replace(/[\\/]+$/, '').toLowerCase();
+        let bestLen = -1;
         for (const pr of projectRoots) {
           const normRoot = path
             .resolve(normalizeCodexPath(pr.path))
             .replace(/[\\/]+$/, '')
             .toLowerCase();
           if (normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`)) {
-            serverProjectId = pr.project_id;
-            break;
+            if (normRoot.length > bestLen) {
+              bestLen = normRoot.length;
+              serverProjectId = pr.project_id;
+            }
           }
+        }
+        if (!serverProjectId) {
+          const newProjId = randomUUID();
+          const nowMs = Date.now();
+          const maxPosRow = stateDb.prepare(`SELECT COALESCE(MAX(position), -1) AS maxPos FROM projects`).get();
+          const nextPos = (Number(maxPosRow?.maxPos) || 0) + 1;
+          const projName = path.basename(normalizedCwd) || 'Workspace';
+          stateDb
+            .prepare(
+              `INSERT INTO projects (id, name, metadata, position, created_at_ms, updated_at_ms)
+               VALUES (?, ?, '{}', ?, ?, ?)`,
+            )
+            .run(newProjId, projName, nextPos, nowMs, nowMs);
+          stateDb
+            .prepare(
+              `INSERT INTO project_roots (project_id, position, path)
+               VALUES (?, 0, ?)`,
+            )
+            .run(newProjId, normalizedCwd);
+          serverProjectId = newProjId;
         }
       } catch {
         // Ignore if `project_roots` table is not present on older Codex versions.
@@ -304,7 +373,7 @@ export async function syncCodexDesktopCatalog({
               SET originator = 'Codex Desktop',
                   thread_source = 'user',
                   cwd = ?,
-                  project_id = COALESCE(project_id, ?),
+                  project_id = COALESCE(?, project_id),
                   title = CASE
                     WHEN title IS NULL OR TRIM(title) = '' THEN ?
                     ELSE title
@@ -325,6 +394,7 @@ export async function syncCodexDesktopCatalog({
         )
         .get(threadId);
       serverProjectId = threadRow?.project_id || serverProjectId;
+      result.projectId = serverProjectId;
       result.syncedStateDb = Boolean(threadRow);
     } catch {
       // Ignore SQLite contention or schema differences.
@@ -479,44 +549,31 @@ export async function syncCodexDesktopCatalog({
     result.ipcNotified = await notifyCodexDesktopIpc({ threadId, codexHome });
 
     const globalStatePath = path.join(codexHome, '.codex-global-state.json');
-    if (fs.existsSync(globalStatePath)) {
+    if (!result.ipcNotified && fs.existsSync(globalStatePath)) {
       try {
         const globalState = JSON.parse(fs.readFileSync(globalStatePath, 'utf8'));
         const localProjects = globalState['local-projects'] || {};
         const matchedProjectId = findMatchingCodexProjectId(localProjects, rowCwd);
 
         if (!matchedProjectId) {
-          if (result.ipcNotified && process.platform === 'win32') {
-            // Trigger the running ChatGPT.exe's single-instance deep-link handler so it
-            // registers `rowCwd` in its in-memory `globalState` (`local-projects`).
-            const deepLink = `codex://threads/new?path=${encodeURIComponent(rowCwd)}`;
-            const psCmd = `$exe = Get-Process ChatGPT -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path; if ($exe) { Start-Process -FilePath $exe -ArgumentList @('--single-argument', '${deepLink.replace(/'/g, "''")}') }`;
-            const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
-              detached: true,
-              stdio: 'ignore',
-              windowsHide: true,
-            });
-            child.unref();
-          } else if (!result.ipcNotified) {
-            const newProjectId = randomUUID();
-            const nowMs = Date.now();
-            localProjects[newProjectId] = {
-              id: newProjectId,
-              name: path.basename(rowCwd) || 'Workspace',
-              rootPaths: [rowCwd],
-              createdAt: nowMs,
-              updatedAt: nowMs,
-            };
-            globalState['local-projects'] = localProjects;
-            const projectOrder = Array.isArray(globalState['project-order'])
-              ? globalState['project-order']
-              : [];
-            if (!projectOrder.includes(newProjectId)) {
-              globalState['project-order'] = [newProjectId, ...projectOrder];
-            }
-            globalState['selected-project'] = { type: 'local', projectId: newProjectId };
-            fs.writeFileSync(globalStatePath, JSON.stringify(globalState), 'utf8');
+          const newProjectId = serverProjectId || randomUUID();
+          const nowMs = Date.now();
+          localProjects[newProjectId] = {
+            id: newProjectId,
+            name: path.basename(rowCwd) || 'Workspace',
+            rootPaths: [rowCwd],
+            createdAt: nowMs,
+            updatedAt: nowMs,
+          };
+          globalState['local-projects'] = localProjects;
+          const projectOrder = Array.isArray(globalState['project-order'])
+            ? globalState['project-order']
+            : [];
+          if (!projectOrder.includes(newProjectId)) {
+            globalState['project-order'] = [newProjectId, ...projectOrder];
           }
+          globalState['selected-project'] = { type: 'local', projectId: newProjectId };
+          fs.writeFileSync(globalStatePath, JSON.stringify(globalState), 'utf8');
         }
       } catch {
         // Ignore global state parse/write errors.
@@ -633,6 +690,63 @@ export class CodexAppServerDriver {
   }
 
   /**
+   * Ensures `effectiveProjectRoot` is registered as a first-class project in `codex app-server`
+   * via `project/list` and `project/create`, selecting the most-specific matching project root
+   * and returning its `projectId`.
+   *
+   * @param {object} transport
+   * @param {string} effectiveProjectRoot
+   * @param {boolean} [isSsh=false]
+   * @returns {Promise<string | null>}
+   */
+  async _ensureCodexProject(transport, effectiveProjectRoot, isSsh = false) {
+    if (!effectiveProjectRoot) return null;
+    const normPath = (p) =>
+      isSsh
+        ? String(p || '').replace(/\/+$/, '')
+        : path.resolve(normalizeCodexPath(p)).replace(/[\\/]+$/, '').toLowerCase();
+
+    const targetNorm = normPath(effectiveProjectRoot);
+    const listRes = await transport.request('project/list', {}, 10000);
+    const projects = Array.isArray(listRes?.data) ? listRes.data : [];
+
+    let bestId = null;
+    let bestLen = -1;
+    const sep = isSsh ? '/' : path.sep;
+    for (const proj of projects) {
+      const roots = Array.isArray(proj?.roots) ? proj.roots : [];
+      for (const r of roots) {
+        const rootPath = typeof r === 'string' ? r : r?.path;
+        if (!rootPath) continue;
+        const rootNorm = normPath(rootPath);
+        if (targetNorm === rootNorm || targetNorm.startsWith(`${rootNorm}${sep}`)) {
+          if (rootNorm.length > bestLen) {
+            bestLen = rootNorm.length;
+            bestId = proj.id || null;
+          }
+        }
+      }
+    }
+    if (bestId && bestLen === targetNorm.length) {
+      return bestId;
+    }
+
+    const projName =
+      (isSsh ? path.posix.basename(effectiveProjectRoot) : path.basename(effectiveProjectRoot)) ||
+      'Workspace';
+    const createdRes = await transport.request(
+      'project/create',
+      {
+        idempotencyKey: randomUUID(),
+        name: projName,
+        roots: [{ path: effectiveProjectRoot }],
+      },
+      10000,
+    );
+    return createdRes?.project?.id || bestId || null;
+  }
+
+  /**
    * Executes or resumes a turn on a local or remote Codex `app-server` instance.
    *
    * @param {object} snapshot - Mutable H2HTaskSnapshot instance
@@ -701,6 +815,8 @@ export class CodexAppServerDriver {
       runtime.turnDoneResolve = resolve;
       runtime.turnDoneReject = reject;
     });
+    runtime.turnDonePromise = turnDonePromise;
+    runtime.attentionListeners = new Set();
 
     transport.on('notification', (method, params) => {
       this._handleNotification(runtime, method, params, appendEvent, emitUpdate);
@@ -711,6 +827,9 @@ export class CodexAppServerDriver {
     });
 
     transport.on('error', (err) => {
+      if (runtime.committedOutput !== undefined) {
+        snapshot.output = runtime.committedOutput;
+      }
       snapshot.status = 'failed';
       snapshot.stopReason = 'error';
       snapshot.error = err.message || String(err);
@@ -720,6 +839,9 @@ export class CodexAppServerDriver {
 
     transport.on('exit', (code, signal) => {
       if (snapshot.status === 'running' || snapshot.status === 'queued' || snapshot.status === 'attention_required') {
+        if (runtime.committedOutput !== undefined) {
+          snapshot.output = runtime.committedOutput;
+        }
         if (runtime.abortedByCaller) {
           snapshot.status = 'aborted';
           snapshot.stopReason = 'aborted';
@@ -759,6 +881,22 @@ export class CodexAppServerDriver {
         this.targetConfig.env?.CODEX_HOME ||
         process.env.CODEX_HOME ||
         path.join(os.homedir(), '.codex');
+      const rawTargetCwd = snapshot.cwd || process.cwd();
+      const effectiveCwd = isSsh ? rawTargetCwd : normalizeCodexPath(path.resolve(rawTargetCwd));
+      const explicitProjectRoot = snapshot.projectSelector?.root || null;
+      const effectiveProjectRoot = isSsh
+        ? explicitProjectRoot || effectiveCwd
+        : explicitProjectRoot
+          ? normalizeCodexPath(path.resolve(normalizeCodexPath(explicitProjectRoot)))
+          : resolveGitWorktreeRoot(effectiveCwd);
+      runtime.effectiveProjectRoot = effectiveProjectRoot;
+
+      if (isPersistent && !isSsh) {
+        ensureCodexConfigTrustedProject(codexHome, effectiveProjectRoot);
+        if (effectiveCwd !== effectiveProjectRoot) {
+          ensureCodexConfigTrustedProject(codexHome, effectiveCwd);
+        }
+      }
 
       // 1. Handshake
       await transport.request(
@@ -770,12 +908,29 @@ export class CodexAppServerDriver {
             version: '0.1.0',
           },
           capabilities: {
-            experimentalApi: false,
+            experimentalApi: true,
           },
         },
         20000,
       );
       transport.notify('initialized');
+
+      // 1b. Ensure target project workspace is onboarded in Codex app-server when persistent
+      let projectId = snapshot.project?.id || null;
+      if (isPersistent) {
+        if (!projectId) {
+          projectId = await this._ensureCodexProject(transport, effectiveProjectRoot, isSsh).catch(
+            () => null,
+          );
+        }
+      } else {
+        snapshot.project = {
+          id: null,
+          root: effectiveProjectRoot,
+          binding: 'not-required',
+          mechanism: null,
+        };
+      }
 
       // 2. Map ReinPolicy to Codex sandbox and approval parameters
       const { approvalPolicy, sandbox } = mapReinPolicyToCodex(snapshot.reinPolicy);
@@ -787,21 +942,105 @@ export class CodexAppServerDriver {
 
       // 3. Start a new thread or resume an existing persistent session
       const isNewThread = !runtime.threadId;
+      let existingThreadProjectId = null;
+      let existingThreadRoots = [];
+      if (!isNewThread && !isSsh) {
+        const stateDbPath = path.join(codexHome, 'state_5.sqlite');
+        if (fs.existsSync(stateDbPath)) {
+          let stateDb = null;
+          try {
+            stateDb = new DatabaseSync(stateDbPath);
+            stateDb.exec('PRAGMA busy_timeout = 2000;');
+            const tRow = stateDb
+              .prepare(`SELECT project_id, cwd FROM threads WHERE id = ?`)
+              .get(runtime.threadId);
+            if (tRow?.project_id) {
+              existingThreadProjectId = tRow.project_id;
+              const pRoots = stateDb
+                .prepare(`SELECT path FROM project_roots WHERE project_id = ?`)
+                .all(existingThreadProjectId);
+              existingThreadRoots = pRoots.map((r) => r.path).filter(Boolean);
+            } else if (tRow?.cwd) {
+              existingThreadRoots = [tRow.cwd];
+            }
+          } catch {
+            // Ignore SQLite read errors.
+          } finally {
+            try {
+              stateDb?.close();
+            } catch {
+              // Ignore close errors.
+            }
+          }
+        }
+      }
+
       if (runtime.threadId) {
-        const resumeRes = await transport.request(
-          'thread/resume',
-          {
-            threadId: runtime.threadId,
-            cwd: snapshot.cwd || process.cwd(),
-            ...(effectiveModel ? { model: effectiveModel } : {}),
-            ...(threadConfigOverrides ? { config: threadConfigOverrides } : {}),
-            approvalPolicy,
-            sandbox,
-            excludeTurns: true,
-          },
-          30000,
-        );
+        let resumeRes;
+        try {
+          resumeRes = await transport.request(
+            'thread/resume',
+            {
+              threadId: runtime.threadId,
+              cwd: effectiveCwd,
+              ...(effectiveModel ? { model: effectiveModel } : {}),
+              ...(threadConfigOverrides ? { config: threadConfigOverrides } : {}),
+              approvalPolicy,
+              sandbox,
+              excludeTurns: true,
+            },
+            30000,
+          );
+        } catch (resumeErr) {
+          if (/already has an active writer/i.test(String(resumeErr?.message || ''))) {
+            resumeRes = await transport.request(
+              'thread/fork',
+              {
+                threadId: runtime.threadId,
+                cwd: effectiveCwd,
+                ...(effectiveModel ? { model: effectiveModel } : {}),
+                ...(threadConfigOverrides ? { config: threadConfigOverrides } : {}),
+                approvalPolicy,
+                sandbox,
+              },
+              30000,
+            );
+          } else {
+            throw resumeErr;
+          }
+        }
         runtime.threadId = resumeRes?.thread?.id || runtime.threadId;
+        if (resumeRes?.thread?.projectId) {
+          existingThreadProjectId = resumeRes.thread.projectId;
+        }
+        if (resumeRes?.thread?.cwd && existingThreadRoots.length === 0) {
+          existingThreadRoots = [resumeRes.thread.cwd];
+        }
+        if (
+          existingThreadProjectId &&
+          snapshot.projectSelector?.id &&
+          snapshot.projectSelector.id !== existingThreadProjectId
+        ) {
+          throw new Error(
+            `[H2H-PROJ-05] Project binding mismatch: native session "${runtime.threadId}" is bound to project "${existingThreadProjectId}", cannot rebind to "${snapshot.projectSelector.id}".`,
+          );
+        }
+        if (snapshot.projectSelector?.root && existingThreadRoots.length > 0) {
+          const normComparePath = (p) =>
+            isSsh
+              ? path.posix.resolve('/', String(p || '')).replace(/\/+$/, '')
+              : path.resolve(normalizeCodexPath(p)).replace(/[\\/]+$/, '').toLowerCase();
+          const reqNorm = normComparePath(snapshot.projectSelector.root);
+          const matchesRoot = existingThreadRoots.some((r) => normComparePath(r) === reqNorm);
+          if (!matchesRoot) {
+            throw new Error(
+              `[H2H-PROJ-05] Project binding mismatch: native session "${runtime.threadId}" is bound to project root "${existingThreadRoots[0]}", cannot rebind to "${snapshot.projectSelector.root}".`,
+            );
+          }
+        }
+        if (existingThreadProjectId) {
+          projectId = existingThreadProjectId;
+        }
         if (resumeRes?.model && !snapshot.model) {
           snapshot.model = resumeRes.model;
         }
@@ -812,7 +1051,7 @@ export class CodexAppServerDriver {
         const startRes = await transport.request(
           'thread/start',
           {
-            cwd: snapshot.cwd || process.cwd(),
+            cwd: effectiveCwd,
             ephemeral: snapshot.sessionMode === 'ephemeral',
             ...(effectiveModel ? { model: effectiveModel } : {}),
             ...(threadConfigOverrides ? { config: threadConfigOverrides } : {}),
@@ -835,6 +1074,27 @@ export class CodexAppServerDriver {
         throw new Error('Codex app-server did not return a valid thread.id.');
       }
 
+      let metadataBound = false;
+      let metadataRpcUnsupported = false;
+      if (isPersistent && projectId) {
+        metadataBound = await transport
+          .request(
+            'thread/metadata/update',
+            {
+              threadId: runtime.threadId,
+              projectId,
+            },
+            5000,
+          )
+          .then((res) => Boolean(res?.thread?.projectId === projectId))
+          .catch((err) => {
+            if (err?.code === -32601 || /method not found/i.test(String(err?.message || ''))) {
+              metadataRpcUnsupported = true;
+            }
+            return false;
+          });
+      }
+
       if (isPersistent && isNewThread) {
         await transport
           .request(
@@ -849,23 +1109,46 @@ export class CodexAppServerDriver {
       }
 
       snapshot.sessionId = runtime.threadId;
-      snapshot.resumeCommandHint = buildResumeCommandHint({
-        kind: 'codex',
-        sessionId: snapshot.sessionId,
-        sessionMode: snapshot.sessionMode,
-        transportType: this.targetConfig.transport?.type || this.targetConfig.transport?.kind || 'local',
-        sshHost: this.targetConfig.transport?.host,
-      });
-      emitUpdate();
+      snapshot.resumeCommandHint =
+        buildResumeCommandHint({
+          kind: 'codex',
+          sessionId: snapshot.sessionId,
+          sessionMode: snapshot.sessionMode,
+          transportType:
+            this.targetConfig.transport?.type || this.targetConfig.transport?.kind || 'local',
+          sshHost: this.targetConfig.transport?.host,
+        }) || null;
 
       if (isPersistent && !isSsh) {
-        await syncCodexDesktopCatalog({
+        const syncRes = await syncCodexDesktopCatalog({
           threadId: runtime.threadId,
-          cwd: snapshot.cwd || process.cwd(),
+          cwd: effectiveProjectRoot,
           title: threadTitle,
+          projectId,
           codexHome,
-        }).catch(() => {});
+        }).catch(() => null);
+        if (syncRes?.projectId && !projectId && metadataRpcUnsupported) {
+          projectId = syncRes.projectId;
+        }
+        if (syncRes?.syncedStateDb && projectId && metadataRpcUnsupported) {
+          metadataBound = true;
+        }
       }
+
+      if (isPersistent) {
+        snapshot.project = {
+          id: projectId,
+          root: effectiveProjectRoot,
+          binding: projectId && metadataBound ? 'bound' : 'failed',
+          mechanism: projectId && metadataBound ? 'native-id' : null,
+        };
+        if (snapshot.project.binding !== 'bound') {
+          throw new Error(
+            `[H2H-PROJ-04] Failed to bind persistent session "${runtime.threadId}" to project (${snapshot.projectSelector?.id || projectId || effectiveProjectRoot}).`,
+          );
+        }
+      }
+      emitUpdate();
 
       // 4. Frame prompt according to preset and start turn
       const framedPrompt = applyPresetPrompt(prompt, snapshot.preset);
@@ -903,8 +1186,9 @@ export class CodexAppServerDriver {
       if (isPersistent && !isSsh) {
         await syncCodexDesktopCatalog({
           threadId: runtime.threadId,
-          cwd: snapshot.cwd || process.cwd(),
+          cwd: effectiveProjectRoot,
           title: threadTitle,
+          projectId,
           codexHome,
         }).catch(() => {});
       }
@@ -936,18 +1220,51 @@ export class CodexAppServerDriver {
 
     if (method === 'turn/started') {
       runtime.activeTurnId = params?.turn?.id || runtime.activeTurnId;
+      runtime.committedOutput = '';
+      runtime.itemPhases = new Map();
+      runtime.pendingItemDeltas = new Map();
+      snapshot.output = '';
+      snapshot.error = null;
       snapshot.metrics.turnCount = (snapshot.metrics.turnCount || 0) + 1;
       snapshot.status = 'running';
       emitUpdate();
       return;
     }
 
+    if (method === 'item/started') {
+      const item = params?.item;
+      if (item?.id && item?.type === 'agentMessage') {
+        runtime.itemPhases = runtime.itemPhases || new Map();
+        const phase = item.phase || null;
+        runtime.itemPhases.set(item.id, phase);
+        if (phase === 'final_answer' && runtime.pendingItemDeltas?.has(item.id)) {
+          const buffered = runtime.pendingItemDeltas.get(item.id) || '';
+          runtime.pendingItemDeltas.delete(item.id);
+          if (buffered) {
+            snapshot.output = `${snapshot.output || ''}${buffered}`;
+            emitUpdate();
+          }
+        }
+      }
+      return;
+    }
+
     if (method === 'item/agentMessage/delta') {
       const delta = params?.delta || '';
-      if (delta) {
-        // Keep live output responsive during long generations before item/completed arrives
+      const itemId = params?.itemId;
+      const knownPhase = itemId && runtime.itemPhases ? runtime.itemPhases.get(itemId) : null;
+      if (!delta) return;
+      if (knownPhase === 'final_answer') {
+        // Stream verified final-answer deltas while keeping committedOutput intact
         snapshot.output = `${snapshot.output || ''}${delta}`;
         emitUpdate();
+      } else if (knownPhase === null && itemId) {
+        // Buffer deltas whose phase is not yet known so commentary never leaks into output
+        runtime.pendingItemDeltas = runtime.pendingItemDeltas || new Map();
+        runtime.pendingItemDeltas.set(
+          itemId,
+          `${runtime.pendingItemDeltas.get(itemId) || ''}${delta}`,
+        );
       }
       return;
     }
@@ -957,14 +1274,20 @@ export class CodexAppServerDriver {
       if (!item) return;
 
       if (item.type === 'agentMessage') {
+        if (item.id && runtime.pendingItemDeltas) {
+          runtime.pendingItemDeltas.delete(item.id);
+        }
         const text = item.text || '';
         const phase = item.phase || 'final_answer';
         if (phase === 'commentary') {
           snapshot.commentary = snapshot.commentary
             ? `${snapshot.commentary}\n${text}`
             : text;
+          // Restore committed output in case deltas arrived before phase was known
+          snapshot.output = runtime.committedOutput ?? '';
         } else {
           // Authoritative final text for the completed agentMessage item
+          runtime.committedOutput = text;
           snapshot.output = text;
         }
         appendEvent({
@@ -1006,10 +1329,17 @@ export class CodexAppServerDriver {
       if (turn.status === 'completed') {
         snapshot.status = 'completed';
         snapshot.stopReason = 'end_turn';
+        snapshot.error = null;
       } else if (turn.status === 'interrupted' || runtime.abortedByCaller) {
+        if (runtime.committedOutput !== undefined) {
+          snapshot.output = runtime.committedOutput;
+        }
         snapshot.status = 'aborted';
         snapshot.stopReason = 'aborted';
       } else {
+        if (runtime.committedOutput !== undefined) {
+          snapshot.output = runtime.committedOutput;
+        }
         snapshot.status = 'failed';
         snapshot.stopReason = 'error';
         snapshot.error =
@@ -1022,13 +1352,82 @@ export class CodexAppServerDriver {
   }
 
   /**
+   * Checks whether an approval request under `auto-edit` is strictly confined to the
+   * bound workspace root (`effectiveProjectRoot`) and does not request outside-workspace
+   * permissions or interactive user input.
+   */
+  _isWithinWorkspaceForAutoEdit(runtime, method, params) {
+    const workspaceRoot =
+      runtime.effectiveProjectRoot ||
+      runtime.snapshot?.project?.root ||
+      runtime.snapshot?.cwd;
+    if (!workspaceRoot || !params || typeof params !== 'object') {
+      return false;
+    }
+    const normRoot = path
+      .resolve(normalizeCodexPath(workspaceRoot))
+      .replace(/[\\/]+$/, '')
+      .toLowerCase();
+    const isInside = (candidate) => {
+      if (!candidate || typeof candidate !== 'string') return false;
+      const resolved = path
+        .resolve(normalizeCodexPath(workspaceRoot), normalizeCodexPath(candidate))
+        .replace(/[\\/]+$/, '')
+        .toLowerCase();
+      return resolved === normRoot || resolved.startsWith(`${normRoot}${path.sep}`);
+    };
+
+    if (method === 'item/fileChange/requestApproval') {
+      if (params.grantRoot && !isInside(params.grantRoot)) {
+        return false;
+      }
+      if (params.cwd && !isInside(params.cwd)) {
+        return false;
+      }
+      const rawPaths =
+        Array.isArray(params.changes) && params.changes.length > 0
+          ? params.changes.map((c) => c?.path || c?.filePath)
+          : Array.isArray(params.paths) && params.paths.length > 0
+            ? params.paths
+            : null;
+      if (!rawPaths || rawPaths.length === 0) {
+        return false;
+      }
+      return rawPaths.every((p) => isInside(p));
+    }
+
+    if (method === 'item/commandExecution/requestApproval') {
+      // In Codex `workspace-write` sandbox mode, sandboxed workspace commands run without
+      // requesting approval; any command approval request must prove explicit sandbox
+      // confinement (`sandboxed: true` and verified `writableRoots`) or be escalated.
+      if (params.sandboxed !== true || params.requiresEscalation === true) {
+        return false;
+      }
+      if (params.grantRoot && !isInside(params.grantRoot)) {
+        return false;
+      }
+      if (params.cwd && !isInside(params.cwd)) {
+        return false;
+      }
+      if (!Array.isArray(params.writableRoots) || params.writableRoots.length === 0) {
+        return false;
+      }
+      return params.writableRoots.every((r) => isInside(r));
+    }
+
+    return false;
+  }
+
+  /**
    * Handles server-initiated approval and user-input requests from `codex app-server`.
    */
   _handleServerRequest(runtime, id, method, params, appendEvent, emitUpdate) {
     const { snapshot, transport } = runtime;
     const policy = snapshot.reinPolicy;
 
-    const autoAccept = policy === 'free-rein' || policy === 'auto-edit';
+    const autoAccept =
+      policy === 'free-rein' ||
+      (policy === 'auto-edit' && this._isWithinWorkspaceForAutoEdit(runtime, method, params));
     const autoDecline = policy === 'plan-only';
 
     const sendDecision = (approved) => {
@@ -1061,9 +1460,10 @@ export class CodexAppServerDriver {
       return;
     }
 
-    // Under `parent-rein` or `tight-rein`, pause task in `attention_required` state
-    // so the parent agent or human operator can approve/reject via `reins steer`.
+    // Under `parent-rein` or `tight-rein` (or escalated `auto-edit`), pause task in `attention_required`
+    // state so the parent agent or human operator can approve/reject via `reins steer`.
     snapshot.status = 'attention_required';
+    snapshot.stopReason = 'attention-required';
     snapshot.attention = {
       requestId: String(id),
       method,
@@ -1080,6 +1480,12 @@ export class CodexAppServerDriver {
       text: snapshot.attention.summary,
     });
     emitUpdate();
+    if (runtime.attentionListeners) {
+      for (const notifyAttention of runtime.attentionListeners) {
+        notifyAttention(snapshot);
+      }
+      runtime.attentionListeners.clear();
+    }
 
     runtime.pendingApproval = {
       id,
@@ -1089,10 +1495,44 @@ export class CodexAppServerDriver {
         runtime.pendingApproval = null;
         snapshot.attention = undefined;
         snapshot.status = 'running';
+        snapshot.stopReason = 'running';
         emitUpdate();
         sendDecision(approved);
       },
     };
+  }
+
+  /**
+   * Waits for an active turn to either complete or pause at the next `attention_required` gate.
+   */
+  _waitForTurnOrAttention(runtime) {
+    if (!runtime || !runtime.turnDonePromise) {
+      return Promise.resolve(runtime?.snapshot);
+    }
+    if (
+      runtime.snapshot?.status === 'completed' ||
+      runtime.snapshot?.status === 'failed' ||
+      runtime.snapshot?.status === 'aborted'
+    ) {
+      return Promise.resolve(runtime.snapshot);
+    }
+    return new Promise((resolve) => {
+      const onAttention = (snap) => {
+        resolve(snap);
+      };
+      runtime.attentionListeners = runtime.attentionListeners || new Set();
+      runtime.attentionListeners.add(onAttention);
+      runtime.turnDonePromise.then(
+        (snap) => {
+          runtime.attentionListeners?.delete(onAttention);
+          resolve(snap);
+        },
+        () => {
+          runtime.attentionListeners?.delete(onAttention);
+          resolve(runtime.snapshot);
+        },
+      );
+    });
   }
 
   /**
@@ -1103,9 +1543,10 @@ export class CodexAppServerDriver {
    * @param {object} steerParams
    * @param {'reply' | 'approve' | 'reject' | 'interrupt'} steerParams.action
    * @param {string} [steerParams.message]
-   * @returns {Promise<{ handledLive: boolean }>}
+   * @param {boolean} [steerParams.wait=false]
+   * @returns {Promise<{ handledLive: boolean, snapshot?: object }>}
    */
-  async steerLive(taskId, { action, message }) {
+  async steerLive(taskId, { action, message, wait = false }) {
     const runtime = this.activeSessions.get(taskId);
     if (!runtime) {
       return { handledLive: false };
@@ -1116,7 +1557,11 @@ export class CodexAppServerDriver {
         throw new Error(`Task "${taskId}" has no pending approval request to ${action}.`);
       }
       runtime.pendingApproval.resolve(action === 'approve');
-      return { handledLive: true };
+      if (wait) {
+        const updated = await this._waitForTurnOrAttention(runtime);
+        return { handledLive: true, snapshot: updated };
+      }
+      return { handledLive: true, snapshot: runtime.snapshot };
     }
 
     if (action === 'interrupt') {
@@ -1129,10 +1574,14 @@ export class CodexAppServerDriver {
           },
           10000,
         );
-        return { handledLive: true };
+        if (wait) {
+          const updated = await this._waitForTurnOrAttention(runtime);
+          return { handledLive: true, snapshot: updated };
+        }
+        return { handledLive: true, snapshot: runtime.snapshot };
       }
-      await this.abort(taskId);
-      return { handledLive: true };
+      await this.abort(taskId, runtime.snapshot);
+      return { handledLive: true, snapshot: runtime.snapshot };
     }
 
     if (action === 'reply') {
@@ -1155,7 +1604,11 @@ export class CodexAppServerDriver {
           },
           15000,
         );
-        return { handledLive: true };
+        if (wait) {
+          const updated = await this._waitForTurnOrAttention(runtime);
+          return { handledLive: true, snapshot: updated };
+        }
+        return { handledLive: true, snapshot: runtime.snapshot };
       }
       return { handledLive: false };
     }
@@ -1164,14 +1617,68 @@ export class CodexAppServerDriver {
   }
 
   /**
+   * Archives a persistent Codex session over a short-lived `codex app-server` transport
+   * when no in-memory runtime is currently open for the task.
+   */
+  async _archiveSessionViaNewTransport(threadId, cwd) {
+    const transportConfig = this.targetConfig.transport;
+    const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
+    const command = isSsh
+      ? (this.targetConfig.command && this.targetConfig.command !== 'auto' ? this.targetConfig.command : 'codex')
+      : resolveExecutable(this.targetConfig.command || 'auto', 'codex');
+    const args =
+      Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
+        ? this.targetConfig.args
+        : ['app-server', '--stdio'];
+    const transport = createJsonRpcTransport({
+      transportConfig,
+      command,
+      args,
+      cwd: cwd || this.targetConfig.defaultCwd || process.cwd(),
+      env: { ...(this.targetConfig.env || {}) },
+    });
+    try {
+      transport.start();
+      await transport.request(
+        'initialize',
+        {
+          clientInfo: { name: 'reins', title: 'Reins H2H Hub', version: '0.1.0' },
+          capabilities: { experimentalApi: true },
+        },
+        10000,
+      );
+      transport.notify('initialized');
+      await transport.request('thread/archive', { threadId }, 5000);
+    } finally {
+      await transport.close().catch(() => {});
+    }
+  }
+
+  /**
    * Aborts an active task and terminates its `codex app-server` subprocess tree.
+   * When `terminateSession: true` (`--kill`) is requested, also archives/terminates
+   * the underlying Codex session (`thread/archive`) and clears `resumeCommandHint`
+   * only after `thread/archive` succeeds.
    *
    * @param {string} taskId
+   * @param {object} [snapshot]
+   * @param {object} [options]
+   * @param {boolean} [options.terminateSession=false]
+   * @param {boolean} [options.hasRemoteOwner=false]
    * @returns {Promise<boolean>}
    */
-  async abort(taskId) {
+  async abort(taskId, snapshot = null, { terminateSession = false, hasRemoteOwner = false } = {}) {
     const runtime = this.activeSessions.get(taskId);
     if (!runtime) {
+      if (hasRemoteOwner) {
+        return false;
+      }
+      if (terminateSession && snapshot?.sessionId) {
+        await this._archiveSessionViaNewTransport(snapshot.sessionId, snapshot.cwd);
+        snapshot.resumeCommandHint = null;
+        snapshot.sessionTerminated = true;
+        return true;
+      }
       return false;
     }
     runtime.abortedByCaller = true;
@@ -1189,7 +1696,34 @@ export class CodexAppServerDriver {
         // Proceed to hard process tree termination.
       }
     }
+    let archiveError = null;
+    if (terminateSession && runtime.threadId) {
+      try {
+        await runtime.transport.request(
+          'thread/archive',
+          {
+            threadId: runtime.threadId,
+          },
+          5000,
+        );
+        if (snapshot) {
+          snapshot.resumeCommandHint = null;
+          snapshot.sessionTerminated = true;
+        }
+        if (runtime.snapshot) {
+          runtime.snapshot.resumeCommandHint = null;
+          runtime.snapshot.sessionTerminated = true;
+        }
+      } catch (err) {
+        archiveError = err;
+      }
+    }
     await runtime.transport.close();
+    if (archiveError) {
+      throw new Error(
+        `Failed to terminate Codex session "${runtime.threadId}" via thread/archive: ${archiveError.message || archiveError}`,
+      );
+    }
     return true;
   }
 }
