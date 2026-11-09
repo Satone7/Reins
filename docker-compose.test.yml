@@ -1,0 +1,16 @@
+services:
+  reins-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      args:
+        NODE_IMAGE: ${REINS_DOCKER_BASE_IMAGE:-node:22-bookworm-slim}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      REINS_TEST_MODEL: ${REINS_TEST_MODEL:-deepseek-flash}
+      REINS_CONFIG: /workspace/reins/config/reins.test.yaml
+      REINS_IGNORE_USER_CONFIG: "1"

@@ -504,6 +504,7 @@ export class TaskManager {
       sessionId,
       transportType: target.transport?.type || 'local',
       sshHost: target.transport?.host,
+      targetRules: target.rules,
       trace,
     });
 

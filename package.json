@@ -11,7 +11,9 @@
   "scripts": {
     "start": "node ./src/index.js",
     "mcp": "node ./src/mcp/index.js",
-    "test": "node --test tests/**/*.test.js"
+    "test": "node --test tests/reins-mvp.test.js",
+    "test:e2e": "node --test tests/docker-e2e.test.js",
+    "test:docker": "docker compose -f docker-compose.test.yml run --rm --build reins-test"
   },
   "engines": {
     "node": ">=20.0.0"

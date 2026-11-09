@@ -1,6 +1,6 @@
 # Reins System Architecture & Roadmap
 
-> **Workspace Paths**: `C:\Users\ariab\Desktop\workspace\reins` (Windows) / `/home/pren/projects/reins` (Ubuntu `faex1`)  
+> **Cross-Platform Runtime**: Windows, macOS, Linux, and Docker (`docker-compose.test.yml`)  
 > **Tech Stack**: Node.js (ESM, `>=20`), zero bloated runtime dependencies, pure-function core state transitions, and built-in test runner (`node --test`).
 
 ---
@@ -43,7 +43,7 @@ Reins uses a layered architecture: **Isomorphic Dual Northbound Surfaces (CLI + 
 1. CodexDriver   • RemoteCodexDriver  │         • ntfy.sh / Bark  • Multi-host Task Board
 2. AgyDriver     • RemoteAgy/Dsh      │         • Feishu / Slack  • 1-Tap Mobile Approval
 3. DshDriver     • ClaudeTmuxDriver   │                           • Live Transcript & Diff
-4. ClaudeDriver    (faex1 / vps)      │
+4. ClaudeDriver    (SSH + Tmux)       │
 ```
 
 ---
@@ -101,7 +101,7 @@ Once Milestone 1A is live, **use Reins itself (`reins delegate local-codex ...`)
 1. **[x / Step 1] `codex`** (`CodexAppServerDriver` — local & SSH)
 2. **[Step 2] `antigravity`** (`AntigravityDriver` — local & SSH)
 3. **[Step 3] `dsh`** (`DshAcpDriver` / `DshSdkDriver` — local & SSH)
-4. **[Step 4] `claudecode`** (`ClaudeTmuxDriver` / `ClaudeSdkDriver` — local & remote `faex1` / `claude-vps`)
+4. **[Step 4] `claudecode`** (`ClaudeTmuxDriver` / `ClaudeSdkDriver` — local & remote SSH + Tmux)
 
 ### Milestone 2: Resident Hub HTTP/SSE Daemon, `git-patch` Sync & Mobile Push (`ntfy` / `Bark`)
 ### Milestone 3: Reins Mobile App

@@ -1,6 +1,7 @@
 # Reins Configuration Example (reins.yaml)
-# Defines local and remote AI Coding Harness targets, ReinPolicies, and mobile notification channels.
-# See protocol specification: docs/H2H_PROTOCOL.md (v0.2)
+# Defines local and remote AI Coding Harness targets, ReinPolicies, caller usage rules, and mobile notification channels.
+# Copy to `~/.reins/config.yaml` (or `./config/reins.yaml`) and customize for your environment.
+# See protocol specification: docs/H2H_PROTOCOL.md
 
 hub:
   host: 127.0.0.1
@@ -41,7 +42,7 @@ targets:
     # model: gpt-6.1-sol
     # effort: high    # low | medium | high | xhigh | max | ultra
     workspace:
-      defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
+      defaultWorkdir: .
       allowedSyncModes: [remote-native, context-only]
     reinPolicy: auto-edit
     tags: [coding, review, adversarial-review, rescue]
@@ -58,7 +59,7 @@ targets:
       args: []
     model: flash_lite
     workspace:
-      defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
+      defaultWorkdir: .
       allowedSyncModes: [remote-native, context-only]
     reinPolicy: parent-rein
     tags: [coding, planning, orchestration]
@@ -73,73 +74,53 @@ targets:
       mode: acp
       command: npx
       args: ["@deepseek-ai/dsh", "--profile", "acp"]
+    model: deepseek-flash
     workspace:
-      defaultWorkdir: C:/Users/ariab/Desktop/workspace/reins
+      defaultWorkdir: .
       allowedSyncModes: [remote-native, context-only]
     reinPolicy: parent-rein
     tags: [coding, automation, plugin-dev]
 
-  # 4. LAN Remote Ubuntu Node (faex1) DeepSeek Harness (headless JSONL)
-  - id: faex1-dsh
-    label: FAEX1 Remote DeepSeek Harness
+  # 4. Remote Linux Node DeepSeek Harness (headless JSONL over SSH)
+  - id: remote-dsh
+    label: Remote Linux DeepSeek Harness
     harnessType: dsh
     transport:
       kind: ssh
-      sshHost: faex1
+      sshHost: dev-node.example.com
       connectTimeoutSec: 20
     driver:
       mode: dsh-headless
-      command: /home/pren/n/bin/dsh
+      command: /usr/local/bin/dsh
       args: []
-    env:
-      PATH: /home/pren/n/bin:/usr/local/bin:/usr/bin:/bin
-      NARB_DISABLE_NATIVE_CACHE: "1"
+    model: deepseek-flash
     workspace:
-      defaultWorkdir: /home/pren/projects/reins
+      defaultWorkdir: /workspace/project
       allowedSyncModes: [remote-native, context-only]
     reinPolicy: auto-edit
     tags: [coding, linux-shell]
 
-  # 5. LAN Remote Ubuntu Node (faex1) Claude Code (Interactive Tmux + JSONL Driver)
-  - id: faex1-claude
-    label: FAEX1 Remote Claude Code
+  # 5. Remote Linux Node Claude Code (Interactive Tmux + JSONL Driver with Caller Usage Rules)
+  - id: remote-claude
+    label: Remote Linux Claude Code (SSH + Tmux)
     harnessType: claude-code
     transport:
       kind: ssh
-      sshHost: faex1
+      sshHost: dev-node.example.com
       connectTimeoutSec: 20
     driver:
       mode: claude-tmux
-      binaryPath: /home/pren/n/bin/claude
-      tmuxPrefix: reins-cc
-      paneCols: 140
-      paneRows: 45
-      extraArgs: []
-    env:
-      PATH: /home/pren/n/bin:/usr/local/bin:/usr/bin:/bin
-    workspace:
-      defaultWorkdir: /home/pren/projects/reins
-      allowedSyncModes: [remote-native, git-patch, context-only]
-    reinPolicy: tight-rein
-    tags: [coding, refactoring, linux-shell, debugging]
-
-  # 6. Cloud Production VPS Claude Code (Connected via ProxyJump)
-  - id: vps-claude
-    label: Cloud VPS Claude Code
-    harnessType: claude-code
-    transport:
-      kind: ssh
-      sshHost: claude-vps
-      connectTimeoutSec: 20
-    driver:
-      mode: claude-tmux
-      binaryPath: /home/frank/.local/bin/claude
+      binaryPath: /usr/local/bin/claude
       tmuxPrefix: reins-cc
       paneCols: 140
       paneRows: 45
       extraArgs: []
     workspace:
-      defaultWorkdir: /home/frank/workspace
+      defaultWorkdir: /workspace/project
       allowedSyncModes: [remote-native, git-patch, context-only]
     reinPolicy: tight-rein
     tags: [coding, architecture, code-review]
+    rules: |
+      1. Language & Documentation: Write all prompts and generated documentation in clear English.
+      2. Timezone Convention: Express all timestamps and log references in UTC or America/Los_Angeles.
+      3. Workspace Discipline: Run tests before concluding a coding turn and summarize changed files.

@@ -1,0 +1,92 @@
+# Reins Standardized Verification & Docker Test Configuration
+# All test targets uniformly use `deepseek-flash` powered by `DEEPSEEK_API_KEY` from `.env`.
+# Remote SSH & Tmux targets connect to the containerized `reins-ssh-node` service.
+
+version: "0.2.0"
+
+hub:
+  host: 127.0.0.1
+  port: 19420
+  stateDir: /tmp/reins-test-state
+  loopGuard:
+    maxHops: 4
+    allowSelfCall: false
+
+targets:
+  # 1. Local DeepSeek Harness (Headless JSONL — powered by deepseek-flash)
+  - id: test-local-dsh
+    label: Test Local DeepSeek Harness (Headless)
+    harnessType: dsh
+    transport:
+      kind: local
+    driver:
+      mode: dsh-headless
+      command: dsh
+      args: []
+    model: deepseek-flash
+    workspace:
+      defaultWorkdir: /workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: auto-edit
+    tags: [test, local, dsh]
+
+  # 2. Local DeepSeek Harness (ACP JSON-RPC — powered by deepseek-flash)
+  - id: test-local-acp
+    label: Test Local DeepSeek Harness (ACP)
+    harnessType: dsh
+    transport:
+      kind: local
+    driver:
+      mode: acp
+      command: dsh
+      args: ["--profile", "acp"]
+    model: deepseek-flash
+    workspace:
+      defaultWorkdir: /workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: auto-edit
+    tags: [test, local, acp]
+
+  # 3. Remote Container SSH DeepSeek Harness (SSH + Headless JSONL — powered by deepseek-flash)
+  - id: test-ssh-dsh
+    label: Test Remote SSH DeepSeek Harness
+    harnessType: dsh
+    transport:
+      kind: ssh
+      sshHost: reins-ssh-node
+      connectTimeoutSec: 15
+    driver:
+      mode: dsh-headless
+      command: /usr/local/bin/dsh
+      args: []
+    model: deepseek-flash
+    workspace:
+      defaultWorkdir: /workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: auto-edit
+    tags: [test, ssh, dsh]
+
+  # 4. Remote Container SSH Claude Code (SSH + Tmux + Stream-JSON — powered by deepseek-flash)
+  - id: test-ssh-claude
+    label: Test Remote SSH Claude Code (Tmux)
+    harnessType: claude-code
+    transport:
+      kind: ssh
+      sshHost: reins-ssh-node
+      connectTimeoutSec: 15
+    driver:
+      mode: claude-tmux
+      binaryPath: /usr/local/bin/claude
+      tmuxPrefix: reins-test-cc
+      paneCols: 120
+      paneRows: 40
+      extraArgs: []
+    model: deepseek-flash
+    workspace:
+      defaultWorkdir: /workspace/reins
+      allowedSyncModes: [remote-native, context-only]
+    reinPolicy: auto-edit
+    tags: [test, ssh, claude-code, tmux]
+    rules: |
+      1. Keep responses concise and deterministic for automated verification.
+      2. Always use the unified test model deepseek-flash.

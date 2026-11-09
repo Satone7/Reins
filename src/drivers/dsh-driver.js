@@ -47,17 +47,27 @@ export class DshDriver {
       targetId: this.targetConfig.id || 'local-dsh',
       kind: 'dsh',
       currentConfig: {
-        model: this.targetConfig.model || 'deepseek-chat',
+        model: this.targetConfig.model || process.env.REINS_TEST_MODEL || 'deepseek-flash',
         effort: this.targetConfig.effort || null,
         provider: 'deepseek',
       },
       models: [
         {
+          id: 'deepseek-flash',
+          model: 'deepseek-flash',
+          displayName: 'DeepSeek Flash',
+          description: 'Fast, low-latency DeepSeek model for coding and automated verification.',
+          isDefault: true,
+          defaultEffort: 'low',
+          supportedEfforts: ['low', 'medium', 'high'],
+          inputModalities: ['text'],
+        },
+        {
           id: 'deepseek-chat',
           model: 'deepseek-chat',
           displayName: 'DeepSeek V3 / Chat',
           description: 'General-purpose coding and agentic tool-use model.',
-          isDefault: true,
+          isDefault: false,
           defaultEffort: 'medium',
           supportedEfforts: ['low', 'medium', 'high'],
           inputModalities: ['text'],
@@ -87,12 +97,17 @@ export class DshDriver {
     const command = isSsh
       ? (configuredCommand === 'auto' ? 'dsh' : configuredCommand)
       : resolveExecutable(configuredCommand, 'dsh');
+    const effectiveModel = snapshot.model || this.targetConfig.model;
+    const env = { ...(this.targetConfig.env || {}), ...envVars };
+    if (effectiveModel) env.DEEPSEEK_MODEL ||= effectiveModel;
+    if (process.env.DEEPSEEK_API_KEY) env.DEEPSEEK_API_KEY ||= process.env.DEEPSEEK_API_KEY;
+    if (process.env.DEEPSEEK_BASE_URL) env.DEEPSEEK_BASE_URL ||= process.env.DEEPSEEK_BASE_URL;
     const transport = createJsonRpcTransport({
       transportConfig,
       command,
       args: Array.isArray(this.targetConfig.args) ? this.targetConfig.args : [],
       cwd: snapshot.cwd || (isSsh ? undefined : process.cwd()),
-      env: { ...(this.targetConfig.env || {}), ...envVars },
+      env,
     });
     const startTimeMs = Date.now();
     const runtime = {
@@ -286,6 +301,10 @@ export class DshDriver {
     if (snapshot.sessionId) args.push('--session-id', snapshot.sessionId);
     args.push(framedPrompt);
     const env = { ...(this.targetConfig.env || {}), ...envVars };
+    const effectiveModel = snapshot.model || this.targetConfig.model;
+    if (effectiveModel) env.DEEPSEEK_MODEL ||= effectiveModel;
+    if (process.env.DEEPSEEK_API_KEY) env.DEEPSEEK_API_KEY ||= process.env.DEEPSEEK_API_KEY;
+    if (process.env.DEEPSEEK_BASE_URL) env.DEEPSEEK_BASE_URL ||= process.env.DEEPSEEK_BASE_URL;
     if (isSsh) env.NARB_DISABLE_NATIVE_CACHE ||= '1';
     const remoteCommand = this.targetConfig.loadCredentialsFromDsh === false
       ? buildPosixCommandLine(command, args, snapshot.cwd, env, { closeStdin: true })

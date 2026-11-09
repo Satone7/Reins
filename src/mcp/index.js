@@ -28,13 +28,13 @@ export const MCP_TOOLS = Object.freeze([
   {
     name: 'reins_targets',
     description:
-      'List all local and remote AI coding harnesses (Codex, Antigravity, DSH, Claude Code) registered in Reins along with their session modes, policies, and availability. Pass targetId or includeModels=true to also retrieve selectable models and reasoning effort levels.',
+      'List all local and remote AI coding harnesses (Codex, Antigravity, DSH, Claude Code) registered in Reins along with their session modes, policies, caller usage rules (`rules`), and availability. Pass targetId or includeModels=true to also retrieve selectable models and reasoning effort levels.',
     inputSchema: {
       type: 'object',
       properties: {
         targetId: {
           type: 'string',
-          description: 'Optional target ID (e.g., "local-codex") to inspect along with its selectable models and reasoning efforts.',
+          description: 'Optional target ID (e.g., "local-codex", "local-dsh", "remote-claude") to inspect along with its selectable models and reasoning efforts.',
         },
         includeModels: {
           type: 'boolean',
@@ -47,14 +47,14 @@ export const MCP_TOOLS = Object.freeze([
   {
     name: 'reins_delegate',
     description:
-      'Delegate a coding task, review, or rescue operation to a target Harness (or resume an existing session). Choose sessionMode="persistent" for multi-turn/resumable work or sessionMode="ephemeral" for one-shot tasks.',
+      'Delegate a coding task, review, or rescue operation to a target Harness (or resume an existing session). Choose sessionMode="persistent" for multi-turn/resumable work or sessionMode="ephemeral" for one-shot tasks. IMPORTANT: Before delegating, inspect the target\'s `rules` field via `reins_targets` and strictly obey all target-specific caller rules when composing `prompt`.',
     inputSchema: {
       type: 'object',
       required: ['targetId', 'prompt'],
       properties: {
         targetId: {
           type: 'string',
-          description: 'Registered target ID (e.g., "local-codex", "local-agy", "faex1-dsh", "faex1-claude").',
+          description: 'Registered target ID (e.g., "local-codex", "local-agy", "local-dsh", "remote-dsh", "remote-claude").',
         },
         prompt: {
           type: 'string',

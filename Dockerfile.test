@@ -1,0 +1,35 @@
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client \
+    openssh-server \
+    tmux \
+    git \
+    ca-certificates \
+    bash \
+  && rm -rf /var/lib/apt/lists/*
+
+# Configure container-internal OpenSSH server for reproducible SSH + Tmux H2H tests
+RUN mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh \
+  && ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" \
+  && cp /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys \
+  && chmod 600 /root/.ssh/authorized_keys \
+  && printf "Host reins-ssh-node\n  HostName 127.0.0.1\n  Port 2222\n  User root\n  IdentityFile /root/.ssh/id_ed25519\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n" > /root/.ssh/config \
+  && chmod 600 /root/.ssh/config \
+  && printf "Port 2222\nPermitRootLogin prohibit-password\nPubkeyAuthentication yes\nPasswordAuthentication no\nAcceptEnv *\n" >> /etc/ssh/sshd_config
+
+WORKDIR /workspace/reins
+COPY . /workspace/reins
+
+# Normalize line endings and install unified DeepSeek-backed harness shims (`dsh`, `claude`)
+RUN sed -i 's/\r$//' /workspace/reins/tests/docker/entrypoint.sh /workspace/reins/tests/docker/deepseek-harness-agent.mjs \
+  && chmod +x /workspace/reins/tests/docker/entrypoint.sh /workspace/reins/tests/docker/deepseek-harness-agent.mjs \
+  && ln -sf /workspace/reins/tests/docker/deepseek-harness-agent.mjs /usr/local/bin/dsh \
+  && ln -sf /workspace/reins/tests/docker/deepseek-harness-agent.mjs /usr/local/bin/claude
+
+ENV REINS_TEST_MODEL=deepseek-flash
+ENV REINS_CONFIG=/workspace/reins/config/reins.test.yaml
+ENV REINS_IGNORE_USER_CONFIG=1
+
+ENTRYPOINT ["/workspace/reins/tests/docker/entrypoint.sh"]

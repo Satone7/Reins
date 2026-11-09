@@ -205,6 +205,9 @@ export class ClaudeCodeDriver {
     args.push('--permission-mode', PERMISSION_MODES[snapshot.reinPolicy] || 'default');
 
     const env = { ...(this.targetConfig.env || {}), ...envVars };
+    if (effectiveModel) env.DEEPSEEK_MODEL ||= effectiveModel;
+    if (process.env.DEEPSEEK_API_KEY) env.DEEPSEEK_API_KEY ||= process.env.DEEPSEEK_API_KEY;
+    if (process.env.DEEPSEEK_BASE_URL) env.DEEPSEEK_BASE_URL ||= process.env.DEEPSEEK_BASE_URL;
     const runtime = { child: null, aborted: false, snapshot, onUpdate };
     this.activeSessions.set(snapshot.taskId, runtime);
     const emitUpdate = () => {

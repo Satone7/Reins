@@ -69,7 +69,7 @@ Every target registered in `reins.yaml` exposes a standardized `HarnessCard`:
     }
   },
   "workspace": {
-    "defaultWorkdir": "C:/Users/ariab/Desktop/workspace/reins",
+    "defaultWorkdir": "/workspace/reins",
     "allowedSyncModes": ["remote-native", "context-only"]
   },
   "reinPolicy": "auto-edit",
@@ -207,7 +207,7 @@ export interface H2HTaskSnapshot {
   readonly protocol: 'reins-h2h/v0.2';
   /** Reins Hub globally unique task identifier */
   readonly taskId: string;
-  /** Target node ID (e.g. 'local-codex', 'local-agy', 'local-dsh', 'faex1-claude') */
+  /** Target node ID (e.g. 'local-codex', 'local-agy', 'local-dsh', 'remote-claude') */
   readonly target: string;
   /** Short human-readable task summary */
   readonly description?: string;
@@ -398,7 +398,7 @@ Delegates a task to a target Harness or resumes an existing session.
 
 | Semantic | MCP Parameter (`reins_delegate`) | CLI Option (`reins delegate <target>`) | Description |
 | :--- | :--- | :--- | :--- |
-| Target ID | `targetId: string` **(required)** | `<target>` **(positional 1)** | Target node ID (e.g. `local-codex`, `local-agy`, `local-dsh`, `faex1-claude`). |
+| Target ID | `targetId: string` **(required)** | `<target>` **(positional 1)** | Target node ID (e.g. `local-codex`, `local-agy`, `local-dsh`, `remote-claude`). |
 | Task prompt | `prompt: string` **(required)** | `-p, --prompt <text>` or<br>`-f, --prompt-file <path>` or<br>`--prompt-stdin` | Full instructions for the target Harness. **CLI supports file and `stdin` input to avoid PowerShell/Bash quoting pitfalls.** |
 | Short title | `description?: string` | `-d, --desc <text>` | 3–8 word task title (compatible with DSH `description`). |
 | Workflow preset | `preset?: 'task' \| 'review' \| 'adversarial-review' \| 'rescue'` | `--preset <name>` | `task`/`rescue` default to `persistent`; `review`/`adversarial-review` default to `ephemeral` + `plan-only` policy. |

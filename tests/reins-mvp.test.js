@@ -45,6 +45,9 @@ import {
   SshStdioTransport,
 } from '../src/transports/ssh.js';
 
+// Decouple unit tests from any developer-local `~/.reins/config.yaml`
+process.env.REINS_IGNORE_USER_CONFIG = '1';
+
 test('SSH shell quoting preserves empty values, quotes, and metacharacters', () => {
   assert.equal(quotePosixShellArg(''), "''");
   assert.equal(quotePosixShellArg('plain text'), "'plain text'");
@@ -57,8 +60,8 @@ test('SSH arguments include connection settings and destination', () => {
     ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-p', '2222', '-i', '/key file', 'agent@example.org', 'echo ready'],
   );
   assert.deepEqual(
-    buildSshArgs({ sshHost: 'faex1' }, 'pwd'),
-    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'faex1', 'pwd'],
+    buildSshArgs({ sshHost: 'reins-ssh-node' }, 'pwd'),
+    ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'reins-ssh-node', 'pwd'],
   );
   assert.throws(() => buildSshArgs({ host: '-oProxyCommand=bad' }, 'pwd'), /valid host/);
 });
@@ -85,7 +88,7 @@ test('SSH command line quotes cwd and arguments and exports valid variables', ()
 
 test('JSON-RPC transport factory selects SSH or local subprocess', () => {
   const options = { command: 'codex', args: ['app-server', '--stdio'], cwd: '/remote/repo' };
-  const remote = createJsonRpcTransport({ ...options, transportConfig: { kind: 'ssh', host: 'faex1' } });
+  const remote = createJsonRpcTransport({ ...options, transportConfig: { kind: 'ssh', host: 'reins-ssh-node' } });
   assert.ok(remote instanceof SshStdioTransport);
   assert.equal(remote.command, 'ssh');
   assert.equal(remote.args.at(-1), "cd '/remote/repo' && 'codex' 'app-server' '--stdio'");
@@ -675,10 +678,10 @@ test('H2H Schema: resumeCommandHint and preset prompt framing', () => {
       sessionId: 'ses_abc',
       sessionMode: 'persistent',
       transportType: 'ssh',
-      sshHost: 'faex1',
+      sshHost: 'reins-ssh-node',
       tmuxSession: 'reins-claude',
     }),
-    'ssh -t faex1 "tmux attach -t reins-claude"',
+    'ssh -t reins-ssh-node "tmux attach -t reins-claude"',
   );
 
   const reviewFramed = applyPresetPrompt('Check auth.js', 'review');
@@ -708,7 +711,7 @@ test('Loop Guard: enforces maxHops and prevents circular target delegation', () 
 
   // Delegation to a second target succeeds at hop 2
   const step2 = advanceTraceOrThrow({
-    targetId: 'faex1-dsh',
+    targetId: 'remote-dsh',
     requestTrace: step1.trace,
     configuredMaxHops: 2,
   });
@@ -718,7 +721,7 @@ test('Loop Guard: enforces maxHops and prevents circular target delegation', () 
   assert.throws(
     () =>
       advanceTraceOrThrow({
-        targetId: 'faex1-claude',
+        targetId: 'remote-claude',
         requestTrace: step2.trace,
         configuredMaxHops: 2,
       }),
@@ -738,15 +741,38 @@ targets:
     driver: codex-app-server
     defaultSessionMode: persistent
     defaultPolicy: auto-edit
+    rules: |
+      1. First rule with colon: keep English
+      2. Timezone: America/Los_Angeles
 `;
   const parsed = parseSimpleYaml(sampleYaml);
   assert.equal(parsed.version, '0.2.0');
   assert.equal(parsed.hub.port, 19420);
   assert.equal(parsed.targets['local-codex'].kind, 'codex');
+  assert.match(parsed.targets['local-codex'].rules, /First rule with colon: keep English/);
+  assert.match(parsed.targets['local-codex'].rules, /America\/Los_Angeles/);
 
-  const registry = new TargetRegistry();
+  const registry = new TargetRegistry({ ignoreUserConfig: true });
   const targets = registry.listTargets();
   assert.ok(targets.some((t) => t.id === 'local-codex' && t.kind === 'codex'));
+  const remoteClaude = targets.find((t) => t.id === 'remote-claude');
+  assert.ok(remoteClaude, 'Expected generic remote-claude example target to be registered');
+  assert.equal(remoteClaude.kind, 'claude-code');
+  assert.equal(remoteClaude.transport.host, 'dev-node.example.com');
+  assert.equal(remoteClaude.defaultCwd, '/workspace/project');
+  assert.match(remoteClaude.rules, /Language & Documentation/);
+  assert.match(remoteClaude.rules, /America\/Los_Angeles/);
+
+  const testRegistry = new TargetRegistry({
+    configPath: path.resolve('config/reins.test.yaml'),
+    ignoreUserConfig: true,
+  });
+  const testTargets = testRegistry.listTargets();
+  for (const targetId of ['test-local-dsh', 'test-local-acp', 'test-ssh-dsh', 'test-ssh-claude']) {
+    const found = testTargets.find((t) => t.id === targetId);
+    assert.ok(found, `Expected ${targetId} in config/reins.test.yaml`);
+    assert.equal(found.model, 'deepseek-flash');
+  }
 });
 
 test('TaskManager & ReinsMcpServer: end-to-end lifecycle with mock driver', async () => {
@@ -866,8 +892,8 @@ test('TaskManager & ReinsMcpServer: end-to-end lifecycle with mock driver', asyn
 
 test('Codex Desktop catalog sync normalizes Windows extended paths and registers persistent threads', async () => {
   assert.equal(
-    normalizeCodexPath('\\\\?\\C:\\Users\\ariab\\Desktop\\workspace\\reins'),
-    'C:\\Users\\ariab\\Desktop\\workspace\\reins',
+    normalizeCodexPath('\\\\?\\C:\\workspace\\reins'),
+    'C:\\workspace\\reins',
   );
   assert.equal(
     deriveCodexThreadTitle('[Reins H2H Preset: coding]\n# Implement Antigravity Driver\nDetails'),
@@ -1134,8 +1160,8 @@ test('H2H Protocol v0.1 conformance invariants: project onboarding, UNC paths, U
     '\\\\server\\share\\repo',
   );
   assert.equal(
-    normalizeCodexPath('\\\\?\\C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol'),
-    'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol',
+    normalizeCodexPath('\\\\?\\C:\\workspace\\h2h-protocol'),
+    'C:\\workspace\\h2h-protocol',
   );
 
   // 2. Git worktree root resolution from subdirectory ([H2H-PROJ-04])
@@ -1198,7 +1224,7 @@ test('H2H Protocol v0.1 conformance invariants: project onboarding, UNC paths, U
     sessionMode: 'persistent',
     reinPolicy: 'auto-edit',
     preset: 'task',
-    cwd: 'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol\\spec\\en',
+    cwd: 'C:\\workspace\\h2h-protocol\\spec\\en',
   });
   normalizeSnapshotEnvelope(pendingCodexSnap);
   assert.equal(pendingCodexSnap.project.root, null);
@@ -1207,14 +1233,14 @@ test('H2H Protocol v0.1 conformance invariants: project onboarding, UNC paths, U
   // 6. Strict auto-edit approval confinement ([H2H-POL-02])
   const codexDriver = new CodexAppServerDriver({ id: 'local-codex', kind: 'codex' });
   const mockRuntime = {
-    effectiveProjectRoot: 'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol',
+    effectiveProjectRoot: 'C:\\workspace\\h2h-protocol',
     snapshot: pendingCodexSnap,
   };
   assert.equal(
     codexDriver._isWithinWorkspaceForAutoEdit(
       mockRuntime,
       'item/commandExecution/requestApproval',
-      { command: 'rm -rf /tmp/outside', cwd: 'C:\\Users\\ariab\\Desktop\\workspace\\h2h-protocol' },
+      { command: 'rm -rf /tmp/outside', cwd: 'C:\\workspace\\h2h-protocol' },
     ),
     false,
   );

@@ -50,8 +50,12 @@ However, when multiple horses wearing different harnesses pull the same carriage
 reins/
 ├── README.md                         # Project overview and vision
 ├── package.json                      # Node.js (ESM) package manifest
+├── .env.example                      # Developer environment template (DEEPSEEK_API_KEY)
+├── Dockerfile.test                   # Self-contained OpenSSH + Tmux + Harness test container
+├── docker-compose.test.yml           # Reproducible Docker test orchestration
 ├── config/
-│   └── reins.example.yaml            # Example configuration for local & remote harness targets
+│   ├── reins.example.yaml            # Example configuration for local & remote harness targets
+│   └── reins.test.yaml               # Standardized test configuration (unified model: deepseek-flash)
 ├── skills/
 │   └── reins/
 │       └── SKILL.md                  # Standard H2H CLI Agent Skill definition
@@ -60,20 +64,49 @@ reins/
 ├── docs/
 │   ├── ARCHITECTURE.md               # System architecture and phased implementation roadmap
 │   └── H2H_PROTOCOL.md               # Reins H2H (Harness-to-Harness) Protocol Specification v0.2
-└── src/
-    ├── index.js                      # Main entry point (CLI & SDK exports)
-    ├── protocol/                     # H2H protocol types, envelopes, and validators
-    ├── cli/                          # Northbound Surface 1: `reins` CLI commands
-    ├── mcp/                          # Northbound Surface 2: `reins-mcp` stdio/HTTP MCP server
-    ├── hub/                          # Core state machine, registry, task router, and loop guard
-    ├── drivers/                      # Southbound Harness drivers (Codex, Antigravity, DSH, Claude)
-    ├── transports/                   # Cross-platform Local subprocess and Remote SSH transports
-    └── notify/                       # Mobile push notification and webhook bridges
+├── src/
+│   ├── index.js                      # Main entry point (CLI & SDK exports)
+│   ├── protocol/                     # H2H protocol types, envelopes, and validators
+│   ├── cli/                          # Northbound Surface 1: `reins` CLI commands
+│   ├── mcp/                          # Northbound Surface 2: `reins-mcp` stdio/HTTP MCP server
+│   ├── hub/                          # Core state machine, registry, task router, and loop guard
+│   ├── drivers/                      # Southbound Harness drivers (Codex, Antigravity, DSH, Claude)
+│   ├── transports/                   # Cross-platform Local subprocess and Remote SSH transports
+│   └── notify/                       # Mobile push notification and webhook bridges
+└── tests/
+    ├── reins-mvp.test.js             # Unit & H2H protocol conformance test suite (offline, decoupled)
+    ├── docker-e2e.test.js            # Live E2E test suite powered by deepseek-flash & Docker SSH/Tmux
+    └── docker/                       # Container entrypoint & DeepSeek-backed test harness agent
 ```
 
 ---
 
-## 4. Quick Navigation (For Coding Agents)
+## 4. Reproducible Testing & Docker Verification (`deepseek-flash`)
+
+Reins decouples developer-local machine configurations (`~/.reins/config.yaml`) from the verification environment so tests are 100% reproducible on any machine:
+
+1. **Unit & Protocol Conformance Tests (Offline, Zero External Dependencies)**:
+   ```bash
+   npm test
+   ```
+   Automatically sets `REINS_IGNORE_USER_CONFIG=1` and verifies all drivers, transports, loop guards, and H2H protocol invariants against deterministic local fixtures.
+
+2. **Live LLM & Docker SSH/Tmux Verification (`deepseek-flash`)**:
+   All live verification targets in [`config/reins.test.yaml`](./config/reins.test.yaml) uniformly use **`deepseek-flash`** and read **`DEEPSEEK_API_KEY`** from your local `.env` file:
+   ```bash
+   # Step 1: Create your local developer .env file (gitignored) and fill in DEEPSEEK_API_KEY
+   cp .env.example .env
+
+   # Step 2: Run the full containerized test suite (OpenSSH + Tmux + deepseek-flash E2E)
+   npm run test:docker
+
+   # Or run local live E2E verification directly on the host
+   npm run test:e2e
+   ```
+
+---
+
+## 5. Quick Navigation (For Coding Agents)
 
 > **Standalone Protocol Specification Repository**:  
 > The vendor-neutral, bilingual (EN / 简体中文) H2H Protocol Specification and living Harness capability registry is maintained at **[`github.com/Satone7/h2h-protocol`](https://github.com/Satone7/h2h-protocol)** (local sibling workspace: `../h2h-protocol`).

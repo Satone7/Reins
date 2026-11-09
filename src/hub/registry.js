@@ -17,7 +17,46 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
 /**
+ * Loads environment variables from a `.env` file into `process.env` without
+ * overwriting already-defined environment variables.
+ *
+ * @param {string} [envPath]
+ * @returns {Record<string, string>}
+ */
+export function loadEnvFile(envPath = path.join(REPO_ROOT, '.env')) {
+  const loaded = {};
+  if (!envPath || !fs.existsSync(envPath)) return loaded;
+  const text = fs.readFileSync(envPath, 'utf8');
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const cleaned = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
+    const eqIdx = cleaned.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = cleaned.slice(0, eqIdx).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let value = cleaned.slice(eqIdx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    } else {
+      const commentIdx = value.search(/\s+#/);
+      if (commentIdx !== -1) value = value.slice(0, commentIdx).trim();
+    }
+    loaded[key] = value;
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+  return loaded;
+}
+
+/**
  * Default built-in configuration used when no user config file is present.
+ * Contains only vendor-neutral local targets; host-specific or remote SSH targets
+ * belong in `~/.reins/config.yaml` or environment-specific config files.
  */
 export const DEFAULT_CONFIG = Object.freeze({
   version: '0.2.0',
@@ -61,47 +100,23 @@ export const DEFAULT_CONFIG = Object.freeze({
       transport: { type: 'local' },
       command: 'npx',
       args: ['@deepseek-ai/dsh', '--profile', 'acp'],
+      model: 'deepseek-flash',
       defaultCwd: process.cwd(),
       defaultPolicy: 'parent-rein',
       defaultSessionMode: 'persistent',
       description: 'Local DeepSeek Harness (ACP)',
     },
-    'faex1-dsh': {
-      id: 'faex1-dsh',
-      kind: 'dsh',
-      driver: 'dsh-headless',
-      transport: {
-        type: 'ssh',
-        host: 'faex1',
-        port: 22,
-      },
-      command: '/home/pren/n/bin/dsh',
-      args: [],
-      env: {
-        PATH: '/home/pren/n/bin:/usr/local/bin:/usr/bin:/bin',
-        NARB_DISABLE_NATIVE_CACHE: '1',
-      },
-      defaultCwd: '/home/pren/projects/reins',
-      defaultPolicy: 'auto-edit',
-      defaultSessionMode: 'persistent',
-      description: 'Remote DeepSeek Harness on Ubuntu server faex1 via ACP over SSH',
-    },
-    'faex1-claude': {
-      id: 'faex1-claude',
+    'local-claude': {
+      id: 'local-claude',
       kind: 'claude-code',
-      driver: 'claude-tmux',
-      transport: {
-        type: 'ssh',
-        host: 'faex1',
-        port: 22,
-      },
-      command: '/home/pren/n/bin/claude',
-      env: { PATH: '/home/pren/n/bin:/usr/local/bin:/usr/bin:/bin' },
-      tmuxSession: 'reins-cc',
-      defaultCwd: '/home/pren/projects/reins',
-      defaultPolicy: 'tight-rein',
+      driver: 'claude-print',
+      transport: { type: 'local' },
+      command: 'auto',
+      args: [],
+      defaultCwd: process.cwd(),
+      defaultPolicy: 'parent-rein',
       defaultSessionMode: 'persistent',
-      description: 'FAEX1 Remote Claude Code (Interactive Tmux + JSONL Driver)',
+      description: 'Local Claude Code CLI',
     },
   },
 });
@@ -180,11 +195,55 @@ export function parseSimpleYaml(text) {
   const rawLines = text.split(/\r?\n/);
   const lines = [];
 
-  for (const rawLine of rawLines) {
+  for (let i = 0; i < rawLines.length; i += 1) {
+    const rawLine = rawLines[i];
     const cleaned = stripInlineComment(rawLine);
     if (!cleaned.trim()) continue;
     const indent = cleaned.match(/^ */)[0].length;
-    lines.push({ indent, content: cleaned.trim() });
+    const content = cleaned.trim();
+
+    // Support YAML literal/folded block scalars (`|`, `|-`, `>`, `>-`)
+    const blockMatch = content.match(/^(-?\s*[A-Za-z0-9_.-]+\s*):\s*([|>][-+]?)$/);
+    if (blockMatch) {
+      const keyPrefix = blockMatch[1];
+      const blockStyle = blockMatch[2];
+      const blockLines = [];
+      let j = i + 1;
+      while (j < rawLines.length) {
+        const nextRaw = rawLines[j];
+        if (!nextRaw.trim()) {
+          blockLines.push({ empty: true, indent: Infinity, raw: '' });
+          j += 1;
+          continue;
+        }
+        const nextIndent = nextRaw.match(/^ */)[0].length;
+        if (nextIndent <= indent) break;
+        blockLines.push({ empty: false, indent: nextIndent, raw: nextRaw });
+        j += 1;
+      }
+      // Trim trailing blank lines inside block scalar
+      while (blockLines.length > 0 && blockLines[blockLines.length - 1].empty) {
+        blockLines.pop();
+      }
+      const nonEmptyIndents = blockLines.filter((b) => !b.empty).map((b) => b.indent);
+      const minBlockIndent = nonEmptyIndents.length > 0 ? Math.min(...nonEmptyIndents) : indent + 2;
+      const strippedLines = blockLines.map((b) =>
+        b.empty ? '' : b.raw.slice(minBlockIndent).trimEnd(),
+      );
+      const blockValue = blockStyle.startsWith('>')
+        ? strippedLines.join('\n').replace(/([^\n])\n([^\n])/g, '$1 $2').trim()
+        : strippedLines.join('\n');
+      lines.push({
+        indent,
+        content: `${keyPrefix}:`,
+        hasBlockValue: true,
+        blockValue,
+      });
+      i = j - 1;
+      continue;
+    }
+
+    lines.push({ indent, content });
   }
 
   function parseMapEntries(startIndex, minIndent) {
@@ -192,7 +251,8 @@ export function parseSimpleYaml(text) {
     let idx = startIndex;
 
     while (idx < lines.length && lines[idx].indent >= minIndent) {
-      const { indent, content } = lines[idx];
+      const line = lines[idx];
+      const { indent, content } = line;
       if (content.startsWith('- ')) {
         break;
       }
@@ -204,7 +264,10 @@ export function parseSimpleYaml(text) {
       const key = parseYamlScalar(content.slice(0, colonIdx));
       const rest = content.slice(colonIdx + 1).trim();
 
-      if (rest) {
+      if (line.hasBlockValue) {
+        obj[key] = line.blockValue;
+        idx += 1;
+      } else if (rest) {
         obj[key] = parseYamlScalar(rest);
         idx += 1;
       } else if (idx + 1 < lines.length && lines[idx + 1].indent > indent) {
@@ -231,15 +294,24 @@ export function parseSimpleYaml(text) {
         lines[idx].indent === listIndent &&
         lines[idx].content.startsWith('- ')
       ) {
-        const itemText = lines[idx].content.slice(2).trim();
-        const colonIdx = itemText.indexOf(':');
-        if (colonIdx !== -1) {
+        const currentLine = lines[idx];
+        const itemText = currentLine.content.slice(2).trim();
+        const isQuotedScalar =
+          (itemText.startsWith('"') && itemText.endsWith('"')) ||
+          (itemText.startsWith("'") && itemText.endsWith("'"));
+        const colonIdx = isQuotedScalar ? -1 : itemText.indexOf(':');
+        const candidateKey = colonIdx !== -1 ? itemText.slice(0, colonIdx).trim() : '';
+        const isObjectEntry = colonIdx !== -1 && /^[A-Za-z0-9_.-]+$/.test(candidateKey);
+
+        if (isObjectEntry) {
           // List of objects (`- key: value` followed by indented fields)
           const itemObj = {};
-          const firstKey = parseYamlScalar(itemText.slice(0, colonIdx));
+          const firstKey = parseYamlScalar(candidateKey);
           const firstRest = itemText.slice(colonIdx + 1).trim();
           idx += 1;
-          if (firstRest) {
+          if (currentLine.hasBlockValue) {
+            itemObj[firstKey] = currentLine.blockValue;
+          } else if (firstRest) {
             itemObj[firstKey] = parseYamlScalar(firstRest);
           } else if (idx < lines.length && lines[idx].indent > listIndent) {
             const [nested, nextIdx] = parseBlock(idx, lines[idx].indent);
@@ -265,6 +337,34 @@ export function parseSimpleYaml(text) {
 
   const [parsed] = parseBlock(0, 0);
   return parsed;
+}
+
+/**
+ * Normalizes target-level caller usage rules / prompt instructions (`rules`, `usageRules`,
+ * `callerRules`, or `instructions`) into a clean multi-line prompt string.
+ *
+ * @param {object} raw
+ * @returns {string | undefined}
+ */
+export function normalizeTargetRules(raw = {}) {
+  const rawRules =
+    raw.rules ??
+    raw.usageRules ??
+    raw.callerRules ??
+    raw.instructions ??
+    raw.callerPrompt;
+
+  if (typeof rawRules === 'string') {
+    const trimmed = rawRules.trim();
+    return trimmed || undefined;
+  }
+  if (Array.isArray(rawRules)) {
+    const lines = rawRules
+      .map((item) => (typeof item === 'string' ? item.trim() : ''))
+      .filter(Boolean);
+    return lines.length > 0 ? lines.join('\n') : undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -345,6 +445,7 @@ export function normalizeTargetConfig(id, raw = {}) {
     driverObj?.effort ||
     driverObj?.reasoningEffort ||
     undefined;
+  const rules = normalizeTargetRules(raw);
 
   return {
     ...raw,
@@ -362,6 +463,7 @@ export function normalizeTargetConfig(id, raw = {}) {
     ...(effort ? { effort } : {}),
     ...(tmuxSession ? { tmuxSession } : {}),
     ...(tmuxPrefix ? { tmuxPrefix } : {}),
+    ...(rules ? { rules } : {}),
   };
 }
 
@@ -399,16 +501,22 @@ export function normalizeTargetsMap(rawTargets) {
  * Loads the active Reins configuration from disk or falls back to `DEFAULT_CONFIG`.
  *
  * @param {string} [configPath]
+ * @param {object} [options]
+ * @param {boolean} [options.ignoreUserConfig]
  * @returns {{ config: object, configSource: string }}
  */
-export function loadConfig(configPath) {
+export function loadConfig(configPath, options = {}) {
+  loadEnvFile();
+  const skipUserConfig =
+    options.ignoreUserConfig === true || process.env.REINS_IGNORE_USER_CONFIG === '1';
+
   const candidates = [
     configPath,
     process.env.REINS_CONFIG,
-    path.resolve(process.cwd(), 'config', 'reins.yaml'),
-    path.resolve(process.cwd(), 'config', 'reins.json'),
-    expandHome('~/.reins/config.yaml'),
-    expandHome('~/.reins/config.json'),
+    !skipUserConfig ? path.resolve(process.cwd(), 'config', 'reins.yaml') : null,
+    !skipUserConfig ? path.resolve(process.cwd(), 'config', 'reins.json') : null,
+    !skipUserConfig ? expandHome('~/.reins/config.yaml') : null,
+    !skipUserConfig ? expandHome('~/.reins/config.json') : null,
     path.join(REPO_ROOT, 'config', 'reins.example.yaml'),
   ].filter(Boolean);
 
@@ -451,8 +559,10 @@ export class TargetRegistry {
    * @param {object} [options]
    * @param {string} [options.configPath]
    * @param {object} [options.configOverride]
+   * @param {boolean} [options.ignoreUserConfig]
    */
-  constructor({ configPath, configOverride } = {}) {
+  constructor({ configPath, configOverride, ignoreUserConfig } = {}) {
+    loadEnvFile();
     if (configOverride) {
       this.config = {
         ...configOverride,
@@ -460,7 +570,7 @@ export class TargetRegistry {
       };
       this.configSource = 'override';
     } else {
-      const loaded = loadConfig(configPath);
+      const loaded = loadConfig(configPath, { ignoreUserConfig });
       this.config = loaded.config;
       this.configSource = loaded.configSource;
     }
@@ -515,6 +625,7 @@ export class TargetRegistry {
         ...(target.model ? { model: target.model } : {}),
         ...(target.effort ? { effort: target.effort } : {}),
         description: target.description || '',
+        ...(target.rules ? { rules: target.rules } : {}),
         available,
         resolvedExecutable,
       };

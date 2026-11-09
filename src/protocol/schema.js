@@ -340,6 +340,7 @@ export function createInitialTaskSnapshot({
   sessionId,
   transportType = 'local',
   sshHost,
+  targetRules,
   trace,
 }) {
   const now = new Date().toISOString();
@@ -386,6 +387,7 @@ export function createInitialTaskSnapshot({
     },
     model: model || null,
     effort: effort || null,
+    ...(targetRules ? { targetRules } : {}),
     resumeCommandHint: resumeHint || null,
     status: 'queued',
     stopReason: null,

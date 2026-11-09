@@ -201,6 +201,12 @@ export async function runCli(argv) {
           if (t.description) {
             console.log(`      ${t.description}`);
           }
+          if (t.rules) {
+            console.log('      Caller Rules:');
+            for (const line of String(t.rules).split(/\r?\n/)) {
+              console.log(`        ${line}`);
+            }
+          }
         }
       }
       return;

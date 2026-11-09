@@ -57,7 +57,7 @@ This is Codex's authoritative programmatic control protocol (also used by IDE ex
 
 ### 2.2 DeepSeek Harness (`dsh`) Subagent Architecture (`@deepseek-ai/dsh-subagent*`)
 
-From our source-level inspection of `faex1:~/projects/deepseek-harness/packages/subagent/`, DSH defines a clean delegation seam (`ctx.subagents`):
+From our source-level inspection of `deepseek-harness/packages/subagent/`, DSH defines a clean delegation seam (`ctx.subagents`):
 
 #### (1) Model-Facing Tool Surface (`tool-subagent` + `tool-subagent-control`)
 1. **Delegation Tool (`subagent_<provider>`)**:
