@@ -3,10 +3,12 @@
  * Unified DeepSeek-backed Harness Test Agent for Reins Docker & E2E Verification.
  *
  * Speaks the wire protocols of DSH (`--profile headless --json` and `--profile acp`)
- * and Claude Code (`-p ... --output-format stream-json --verbose` and `--resume`),
- * routing all LLM turns to `deepseek-flash` via `DEEPSEEK_API_KEY`.
+ * and interactive Claude Code (`--session-id <id>` / `--resume <id>` inside `tmux` with
+ * `~/.claude/projects/<slug>/<sessionId>.jsonl` transcript output), routing all LLM turns
+ * to `deepseek-flash` via `DEEPSEEK_API_KEY`.
  */
 
+import crypto from 'node:crypto';
 import dns from 'node:dns';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,6 +35,23 @@ function saveHistory(sessionId, messages) {
   fs.writeFileSync(file, JSON.stringify(messages, null, 2), 'utf8');
 }
 
+function projectSlug(workdir) {
+  return String(workdir || '').replace(/[^A-Za-z0-9]/g, '-');
+}
+
+function resolveClaudeTranscriptPath(cwd, sessionId) {
+  const claudeDir =
+    process.env.CLAUDE_CONFIG_DIR ||
+    path.join(process.env.HOME || process.env.USERPROFILE || os.homedir(), '.claude');
+  const dir = path.join(claudeDir, 'projects', projectSlug(cwd));
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${sessionId}.jsonl`);
+}
+
+function appendTranscriptRecord(filePath, record) {
+  fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
 async function callDeepSeekFlash(messages, requestedModel) {
   const apiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
   if (!apiKey) {
@@ -41,7 +60,11 @@ async function callDeepSeekFlash(messages, requestedModel) {
     );
   }
   const baseUrl = (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, '');
-  const model = requestedModel || process.env.DEEPSEEK_MODEL || process.env.REINS_TEST_MODEL || 'deepseek-flash';
+  const model =
+    requestedModel ||
+    process.env.DEEPSEEK_MODEL ||
+    process.env.REINS_TEST_MODEL ||
+    'deepseek-flash';
 
   async function postCompletion(targetModel) {
     let lastErr;
@@ -58,7 +81,8 @@ async function callDeepSeekFlash(messages, requestedModel) {
             messages: [
               {
                 role: 'system',
-                content: 'You are a concise coding harness assistant running in the Reins H2H test environment. Reply directly and concisely.',
+                content:
+                  'You are a concise coding harness assistant running in the Reins H2H test environment. Reply directly and concisely.',
               },
               ...messages,
             ],
@@ -85,8 +109,6 @@ async function callDeepSeekFlash(messages, requestedModel) {
   }
 
   let res = await postCompletion(model);
-  // If the upstream official endpoint aliases fast V3 under `deepseek-chat` when `deepseek-flash` is requested,
-  // transparently fallback to `deepseek-chat` so both official api.deepseek.com and gateway proxies work.
   if (
     !res.ok &&
     model === 'deepseek-flash' &&
@@ -194,65 +216,127 @@ async function runAcpMode(defaultModel) {
   });
 }
 
-async function runClaudeMode(argv, defaultModel) {
-  const pIdx = argv.indexOf('-p');
-  const resumeIdx = argv.indexOf('--resume');
-  const modelIdx = argv.indexOf('--model');
-  const sessionId =
-    resumeIdx !== -1 && argv[resumeIdx + 1]
-      ? argv[resumeIdx + 1]
-      : `claude_ds_${Date.now().toString(36)}`;
-  const model = modelIdx !== -1 && argv[modelIdx + 1] ? argv[modelIdx + 1] : defaultModel;
-
-  // Interactive tmux resume mode (no `-p` flag): keep process alive inside tmux session
-  if (pIdx === -1) {
-    process.stdout.write(`Claude Code interactive session (${sessionId}, model=${model}) ready.\n`);
-    setInterval(() => {}, 60000);
-    return;
-  }
-
-  const promptText = argv[pIdx + 1] || '';
+async function executeClaudeInteractiveTurn({ sessionId, model, promptText, cwd }) {
+  const transcriptPath = resolveClaudeTranscriptPath(cwd, sessionId);
   const history = loadHistory(sessionId);
   history.push({ role: 'user', content: promptText });
+
+  appendTranscriptRecord(transcriptPath, {
+    type: 'user',
+    uuid: crypto.randomUUID(),
+    sessionId,
+    cwd,
+    origin: { kind: 'human' },
+    message: {
+      role: 'user',
+      content: promptText,
+    },
+  });
 
   const startedAt = Date.now();
   const { reply, usage } = await callDeepSeekFlash(history, model);
   history.push({ role: 'assistant', content: reply });
   saveHistory(sessionId, history);
 
-  process.stdout.write(
-    `${JSON.stringify({
-      type: 'system',
-      subtype: 'init',
-      session_id: sessionId,
+  appendTranscriptRecord(transcriptPath, {
+    type: 'assistant',
+    uuid: crypto.randomUUID(),
+    sessionId,
+    cwd,
+    costUSD: 0.0001,
+    message: {
       model,
-    })}\n`,
-  );
-  process.stdout.write(
-    `${JSON.stringify({
-      type: 'assistant',
-      session_id: sessionId,
-      message: {
-        model,
-        content: [{ type: 'text', text: reply }],
-      },
-    })}\n`,
-  );
-  process.stdout.write(
-    `${JSON.stringify({
-      type: 'result',
-      subtype: 'success',
-      is_error: false,
-      session_id: sessionId,
-      result: reply,
-      duration_ms: Math.max(1, Date.now() - startedAt),
-      total_cost_usd: 0.0001,
+      role: 'assistant',
       usage: {
         input_tokens: usage.inputTokens,
         output_tokens: usage.outputTokens,
+        cache_read_input_tokens: usage.cacheReadTokens,
       },
-    })}\n`,
-  );
+      content: [{ type: 'text', text: reply }],
+    },
+  });
+
+  appendTranscriptRecord(transcriptPath, {
+    type: 'system',
+    uuid: crypto.randomUUID(),
+    sessionId,
+    subtype: 'turn_duration',
+    durationMs: Math.max(1, Date.now() - startedAt),
+  });
+
+  return reply;
+}
+
+async function runClaudeMode(argv, defaultModel) {
+  if (argv.includes('-p') || argv.includes('--print') || argv.includes('--output-format')) {
+    throw new Error('claude -p / --print / --output-format is strictly forbidden.');
+  }
+
+  const resumeIdx = argv.indexOf('--resume');
+  const sessionIdIdx = argv.indexOf('--session-id');
+  const modelIdx = argv.indexOf('--model');
+  const promptIdx = argv.indexOf('--tmux-turn-prompt');
+
+  const sessionId =
+    resumeIdx !== -1 && argv[resumeIdx + 1]
+      ? argv[resumeIdx + 1]
+      : sessionIdIdx !== -1 && argv[sessionIdIdx + 1]
+        ? argv[sessionIdIdx + 1]
+        : `claude_ds_${Date.now().toString(36)}`;
+  const model = modelIdx !== -1 && argv[modelIdx + 1] ? argv[modelIdx + 1] : defaultModel;
+  const cwd = process.cwd();
+
+  // Direct turn execution invoked by mock-tmux.mjs on Windows/host tests
+  if (promptIdx !== -1) {
+    const promptText = argv[promptIdx + 1] || '';
+    await executeClaudeInteractiveTurn({ sessionId, model, promptText, cwd });
+    return;
+  }
+
+  // Interactive PTY/tmux mode (used inside real Linux/Docker tmux session)
+  process.stdout.write(`Claude Code v2.1.302 (${model})\n❯ \n  ⏸ manual mode on · /effort\n`);
+
+  let inputBuffer = '';
+  let debounceTimer = null;
+  let runningTurn = false;
+
+  async function flushTurnIfReady() {
+    if (runningTurn) return;
+    const cleaned = inputBuffer
+      .replace(/\x1b\[200~/g, '')
+      .replace(/\x1b\[201~/g, '')
+      .trim();
+    if (!cleaned) return;
+    inputBuffer = '';
+    runningTurn = true;
+    try {
+      process.stdout.write('\n✻ Thinking… (esc to interrupt)\n');
+      const reply = await executeClaudeInteractiveTurn({
+        sessionId,
+        model,
+        promptText: cleaned,
+        cwd,
+      });
+      process.stdout.write(`\n${reply}\n❯ \n  ⏸ manual mode on · /effort\n`);
+    } catch (err) {
+      process.stderr.write(`${err.message || String(err)}\n`);
+    } finally {
+      runningTurn = false;
+    }
+  }
+
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    inputBuffer += chunk;
+    if (debounceTimer) clearTimeout(debounceTimer);
+    if (/[\r\n]/.test(chunk) && !inputBuffer.includes('\x1b[200~')) {
+      debounceTimer = setTimeout(flushTurnIfReady, 80);
+    } else {
+      debounceTimer = setTimeout(flushTurnIfReady, 200);
+    }
+  });
+
+  setInterval(() => {}, 60000);
 }
 
 async function runDshHeadlessMode(argv, defaultModel) {
@@ -276,20 +360,28 @@ async function runDshHeadlessMode(argv, defaultModel) {
   process.stdout.write(`${JSON.stringify({ type: 'text', text: reply })}\n`);
   process.stdout.write(`${JSON.stringify({ type: 'final', text: reply })}\n`);
   process.stdout.write(`${JSON.stringify({ type: 'status', phase: 'step_end', usage })}\n`);
-  process.stdout.write(`${JSON.stringify({ type: 'status', phase: 'turn_end', reason: { kind: 'complete' } })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ type: 'status', phase: 'turn_end', reason: { kind: 'complete' } })}\n`,
+  );
 }
 
 async function main() {
   const argv = process.argv.slice(2);
   const invokedAs = path.basename(process.argv[1] || '');
-  const defaultModel = process.env.DEEPSEEK_MODEL || process.env.REINS_TEST_MODEL || 'deepseek-flash';
+  const defaultModel =
+    process.env.DEEPSEEK_MODEL || process.env.REINS_TEST_MODEL || 'deepseek-flash';
 
   try {
     if (argv.includes('--profile') && argv[argv.indexOf('--profile') + 1] === 'acp') {
       await runAcpMode(defaultModel);
       return;
     }
-    if (invokedAs.includes('claude') || argv.includes('-p') || argv.includes('--output-format')) {
+    if (
+      invokedAs.includes('claude') ||
+      argv.includes('--permission-mode') ||
+      argv.includes('--tmux-turn-prompt') ||
+      argv.includes('--resume')
+    ) {
       await runClaudeMode(argv, defaultModel);
       return;
     }

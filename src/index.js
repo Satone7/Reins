@@ -34,7 +34,17 @@ export {
 } from './drivers/codex-app-server.js';
 export { AntigravityDriver } from './drivers/antigravity-driver.js';
 export { DshDriver } from './drivers/dsh-driver.js';
-export { ClaudeCodeDriver } from './drivers/claude-code-driver.js';
+export {
+  ClaudeCodeDriver,
+  projectSlug,
+  sanitizeClaudeArgs,
+  detectClaudeAttention,
+  claudePaneLooksBusy,
+  claudePaneLooksReady,
+  createClaudeTranscriptState,
+  foldClaudeTranscriptLine,
+  resolveLocalTranscriptPath,
+} from './drivers/claude-code-driver.js';
 export {
   buildSshArgs,
   quotePosixShellArg,

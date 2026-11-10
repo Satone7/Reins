@@ -109,14 +109,15 @@ export const DEFAULT_CONFIG = Object.freeze({
     'local-claude': {
       id: 'local-claude',
       kind: 'claude-code',
-      driver: 'claude-print',
+      driver: 'claude-tmux',
       transport: { type: 'local' },
       command: 'auto',
       args: [],
+      tmuxPrefix: 'reins-cc',
       defaultCwd: process.cwd(),
       defaultPolicy: 'parent-rein',
       defaultSessionMode: 'persistent',
-      description: 'Local Claude Code CLI',
+      description: 'Local Claude Code CLI (tmux)',
     },
   },
 });
@@ -381,7 +382,11 @@ export function normalizeTargetConfig(id, raw = {}) {
   const driver =
     driverObj?.mode ||
     (typeof raw.driver === 'string' ? raw.driver : null) ||
-    (kind === 'codex' ? 'codex-app-server' : `${kind}-driver`);
+    (kind === 'codex'
+      ? 'codex-app-server'
+      : kind === 'claude-code'
+        ? 'claude-tmux'
+        : `${kind}-driver`);
 
   const command =
     raw.command ||

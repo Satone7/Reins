@@ -34,7 +34,16 @@ import { TaskManager } from '../src/hub/task-manager.js';
 import { ReinsMcpServer } from '../src/mcp/index.js';
 import { AntigravityDriver } from '../src/drivers/antigravity-driver.js';
 import { DshDriver } from '../src/drivers/dsh-driver.js';
-import { ClaudeCodeDriver } from '../src/drivers/claude-code-driver.js';
+import {
+  ClaudeCodeDriver,
+  claudePaneLooksBusy,
+  claudePaneLooksReady,
+  createClaudeTranscriptState,
+  detectClaudeAttention,
+  foldClaudeTranscriptLine,
+  projectSlug,
+  sanitizeClaudeArgs,
+} from '../src/drivers/claude-code-driver.js';
 import {
   CodexAppServerDriver,
   deriveCodexThreadTitle,
@@ -372,52 +381,88 @@ test('TaskManager registers DSH driver modes and kind fallback', () => {
   }
 });
 
-test('Claude Code print mode parses stream-json and resumes persistent sessions', async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-claude-print-'));
+test('Claude Code interactive tmux mode folds JSONL transcripts, strips forbidden -p flags, and resumes sessions', async () => {
+  assert.equal(projectSlug('/home/ubuntu/work/app'), '-home-ubuntu-work-app');
+  assert.deepEqual(
+    sanitizeClaudeArgs(['-p', '--print', '--output-format', 'stream-json', '--no-session-persistence', '--verbose']),
+    ['--verbose'],
+  );
+  assert.equal(claudePaneLooksReady(['Claude Code v2.1.302', '❯ ', '  ⏸ manual mode on']), true);
+  assert.equal(claudePaneLooksBusy(['✻ Thinking… (esc to interrupt)']), true);
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-claude-interactive-'));
   try {
     const logPath = path.join(tempDir, 'claude.jsonl');
+    const tmuxLog = path.join(tempDir, 'tmux.jsonl');
+    const claudeDir = path.join(tempDir, '.claude');
     const driver = new ClaudeCodeDriver({
-      driver: 'claude-print',
+      driver: 'claude-tmux',
       command: process.execPath,
-      args: [path.resolve('tests/fixtures/mock-claude.mjs')],
-      env: { MOCK_CLAUDE_LOG: logPath },
+      args: [path.resolve('tests/fixtures/mock-claude.mjs'), '-p', '--output-format', 'stream-json', '--verbose'],
+      tmuxCommand: process.execPath,
+      tmuxArgs: [path.resolve('tests/fixtures/mock-tmux.mjs')],
+      pollIntervalMs: 15,
+      pasteDelayMs: 5,
+      env: {
+        CLAUDE_CONFIG_DIR: claudeDir,
+        MOCK_CLAUDE_LOG: logPath,
+        MOCK_TMUX_LOG: tmuxLog,
+      },
     });
     const snapshot = createInitialTaskSnapshot({
-      taskId: 'claude-print', targetId: 'mock-claude', kind: 'claude-code',
-      sessionId: 'claude_previous', sessionMode: 'persistent', reinPolicy: 'free-rein', cwd: process.cwd(),
+      taskId: 'claude-interactive',
+      targetId: 'mock-claude',
+      kind: 'claude-code',
+      sessionId: 'claude_previous',
+      sessionMode: 'persistent',
+      reinPolicy: 'free-rein',
+      cwd: tempDir,
     });
     await driver.runTurn(snapshot, { prompt: 'Review the code' });
     assert.equal(snapshot.status, 'completed');
     assert.equal(snapshot.stopReason, 'end_turn');
     assert.equal(snapshot.sessionId, 'claude_previous');
-    assert.equal(snapshot.resumeCommandHint, 'claude --resume claude_previous');
+    assert.match(snapshot.tmuxSession, /^reins-cc-/);
+    assert.equal(snapshot.resumeCommandHint, `tmux attach -t ${snapshot.tmuxSession}`);
     assert.equal(snapshot.output, 'Final reply');
+    assert.equal(snapshot.commentary, 'Analyzing repository context');
     assert.equal(snapshot.metrics.costUsd, 0.012);
     assert.equal(snapshot.metrics.durationMs, 123);
     assert.equal(snapshot.metrics.turnCount, 1);
+    assert.deepEqual(snapshot.metrics.tokens, { inputTokens: 10, outputTokens: 6, cacheReadTokens: 1 });
     assert.deepEqual(snapshot.transcript.messages.map((event) => event.role), ['user', 'tool', 'assistant']);
+
     const args = JSON.parse(fs.readFileSync(logPath, 'utf8').trim());
-    assert.equal(args[args.indexOf('-p') + 1], 'Review the code');
-    assert.equal(args[args.indexOf('--output-format') + 1], 'stream-json');
+    assert.ok(!args.includes('-p'), 'Claude Code args must never include -p');
+    assert.ok(!args.includes('--print'), 'Claude Code args must never include --print');
+    assert.ok(!args.includes('--output-format'), 'Claude Code args must never include --output-format');
     assert.ok(args.includes('--verbose'));
     assert.equal(args[args.indexOf('--resume') + 1], 'claude_previous');
     assert.equal(args[args.indexOf('--permission-mode') + 1], 'bypassPermissions');
-    assert.ok(!args.includes('--no-session-persistence'));
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test('Claude Code maps ReinPolicy flags and keeps ephemeral tmux tasks one-shot', async () => {
+test('Claude Code maps ReinPolicy flags and cleans up ephemeral tmux sessions and transcripts', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-claude-policy-'));
   try {
     const logPath = path.join(tempDir, 'claude.jsonl');
+    const tmuxLog = path.join(tempDir, 'tmux.jsonl');
+    const claudeDir = path.join(tempDir, '.claude');
     const driver = new ClaudeCodeDriver({
       driver: 'claude-tmux',
       command: process.execPath,
       args: [path.resolve('tests/fixtures/mock-claude.mjs')],
-      tmuxCommand: 'missing-tmux-command',
-      env: { MOCK_CLAUDE_LOG: logPath },
+      tmuxCommand: process.execPath,
+      tmuxArgs: [path.resolve('tests/fixtures/mock-tmux.mjs')],
+      pollIntervalMs: 15,
+      pasteDelayMs: 5,
+      env: {
+        CLAUDE_CONFIG_DIR: claudeDir,
+        MOCK_CLAUDE_LOG: logPath,
+        MOCK_TMUX_LOG: tmuxLog,
+      },
     });
     const modes = [
       ['auto-edit', 'acceptEdits'],
@@ -427,8 +472,12 @@ test('Claude Code maps ReinPolicy flags and keeps ephemeral tmux tasks one-shot'
     ];
     for (const [reinPolicy, expectedMode] of modes) {
       const snapshot = createInitialTaskSnapshot({
-        taskId: `claude-${reinPolicy}`, targetId: 'mock-claude', kind: 'claude-code',
-        sessionMode: 'ephemeral', reinPolicy, cwd: process.cwd(),
+        taskId: `claude-${reinPolicy}`,
+        targetId: 'mock-claude',
+        kind: 'claude-code',
+        sessionMode: 'ephemeral',
+        reinPolicy,
+        cwd: tempDir,
       });
       await driver.runTurn(snapshot, { prompt: 'One-shot review' });
       assert.equal(snapshot.status, 'completed');
@@ -436,18 +485,22 @@ test('Claude Code maps ReinPolicy flags and keeps ephemeral tmux tasks one-shot'
       assert.equal(snapshot.tmuxSession, undefined);
       const lines = fs.readFileSync(logPath, 'utf8').trim().split(/\r?\n/);
       const args = JSON.parse(lines.at(-1));
-      assert.ok(args.includes('--no-session-persistence'));
+      assert.ok(!args.includes('-p'));
+      assert.ok(args.includes('--session-id'));
       assert.equal(args[args.indexOf('--permission-mode') + 1], expectedMode);
+      const transcriptFile = path.join(claudeDir, 'projects', projectSlug(tempDir), `${snapshot.sessionId}.jsonl`);
+      assert.equal(fs.existsSync(transcriptFile), false, 'Ephemeral transcript file must be cleaned up');
     }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test('Claude Code persistent tmux mode creates a resumable session and sends keys', async () => {
+test('Claude Code interactive permission dialog pauses in attention_required and steers via Enter/Escape', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-claude-tmux-'));
   try {
     const tmuxLog = path.join(tempDir, 'tmux.jsonl');
+    const claudeDir = path.join(tempDir, '.claude');
     const driver = new ClaudeCodeDriver({
       driver: 'claude-tmux',
       command: process.execPath,
@@ -455,37 +508,74 @@ test('Claude Code persistent tmux mode creates a resumable session and sends key
       tmuxCommand: process.execPath,
       tmuxArgs: [path.resolve('tests/fixtures/mock-tmux.mjs')],
       tmuxPrefix: 'reins-test',
+      pollIntervalMs: 15,
+      pasteDelayMs: 5,
       env: {
+        CLAUDE_CONFIG_DIR: claudeDir,
         MOCK_TMUX_LOG: tmuxLog,
-        MOCK_TMUX_SESSION: path.join(tempDir, 'session'),
+        MOCK_CLAUDE_SCENARIO: 'permission',
       },
     });
     const snapshot = createInitialTaskSnapshot({
-      taskId: 'claude-tmux', targetId: 'mock-claude', kind: 'claude-code',
-      sessionMode: 'persistent', reinPolicy: 'parent-rein', cwd: process.cwd(),
+      taskId: 'claude-tmux',
+      targetId: 'mock-claude',
+      kind: 'claude-code',
+      sessionId: 'claude_mock_12345678',
+      sessionMode: 'persistent',
+      reinPolicy: 'parent-rein',
+      cwd: tempDir,
     });
-    await driver.runTurn(snapshot, { prompt: 'Persistent work' });
+
+    let resolveAttention;
+    const attentionPromise = new Promise((resolve) => {
+      resolveAttention = resolve;
+    });
+    const turnPromise = driver.runTurn(snapshot, { prompt: 'Persistent work' }, (updated) => {
+      if (updated.status === 'attention_required') resolveAttention(updated);
+    });
+
+    await attentionPromise;
+    assert.equal(snapshot.status, 'attention_required');
+    assert.equal(snapshot.attention.kind, 'permission');
+    assert.deepEqual(
+      await driver.steerLive(snapshot.taskId, { action: 'approve', snapshot }),
+      { handledLive: true, snapshot },
+    );
+    await turnPromise;
+
     assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.output, 'Approved final reply');
     assert.equal(snapshot.sessionId, 'claude_mock_12345678');
     assert.match(snapshot.tmuxSession, /^reins-test-/);
     assert.equal(snapshot.resumeCommandHint, `tmux attach -t ${snapshot.tmuxSession}`);
-    assert.deepEqual(await driver.steerLive(snapshot.taskId, { action: 'approve' }), { handledLive: true });
-    assert.deepEqual(await driver.steerLive(snapshot.taskId, { action: 'reject' }), { handledLive: true });
-    assert.deepEqual(await driver.steerLive(snapshot.taskId, { action: 'reply', message: 'Next' }), { handledLive: false });
-    assert.equal(await driver.abort(snapshot.taskId), true);
+    assert.deepEqual(
+      await driver.steerLive(snapshot.taskId, { action: 'reject', snapshot }),
+      { handledLive: true, snapshot },
+    );
+    assert.deepEqual(
+      await driver.steerLive(snapshot.taskId, { action: 'reply', message: 'Next', snapshot }),
+      { handledLive: false },
+    );
+    assert.equal(await driver.abort(snapshot.taskId, snapshot), true);
+    assert.equal(await driver.abort(snapshot.taskId, snapshot, { terminateSession: true }), true);
+    assert.equal(snapshot.sessionTerminated, true);
+
     const calls = fs.readFileSync(tmuxLog, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
     assert.equal(calls[0][0], 'has-session');
     assert.equal(calls[1][0], 'new-session');
     assert.match(calls[1].at(-1), /'--resume' 'claude_mock_12345678'/);
-    assert.deepEqual(calls.slice(2).map((call) => call.slice(-2)), [
-      ['y', 'Enter'], ['n', 'Enter'], [`=${snapshot.tmuxSession}`, 'C-c'],
+    assert.ok(calls.some((c) => c[0] === 'paste-buffer' && c.includes('-p')));
+    assert.deepEqual(calls.slice(-3).map((call) => [call[0], ...call.slice(-2)]), [
+      ['send-keys', `=${snapshot.tmuxSession || 'reins-test-claudemo'}`, 'Escape'],
+      ['send-keys', `=${snapshot.tmuxSession || 'reins-test-claudemo'}`, 'Escape'],
+      ['kill-session', '-t', `=${snapshot.tmuxSession || 'reins-test-claudemo'}`],
     ]);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test('Claude Code tmux replies resume through TaskManager after restart', async () => {
+test('Claude Code tmux replies reuse active tmux session and resume through TaskManager after restart', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-claude-steer-'));
   const traceKeys = ['REINS_TRACE_ID', 'REINS_HOP_COUNT', 'REINS_MAX_HOPS', 'REINS_CALL_CHAIN'];
   const inheritedTrace = Object.fromEntries(traceKeys.map((key) => [key, process.env[key]]));
@@ -493,6 +583,7 @@ test('Claude Code tmux replies resume through TaskManager after restart', async 
   try {
     const claudeLog = path.join(tempDir, 'claude.jsonl');
     const tmuxLog = path.join(tempDir, 'tmux.jsonl');
+    const claudeDir = path.join(tempDir, '.claude');
     const target = normalizeTargetConfig('mock-claude', {
       kind: 'claude-code',
       driver: { mode: 'claude-tmux', tmuxPrefix: 'reins-restart' },
@@ -500,11 +591,14 @@ test('Claude Code tmux replies resume through TaskManager after restart', async 
       args: [path.resolve('tests/fixtures/mock-claude.mjs')],
       tmuxCommand: process.execPath,
       tmuxArgs: [path.resolve('tests/fixtures/mock-tmux.mjs')],
+      pollIntervalMs: 15,
+      pasteDelayMs: 5,
       transport: { type: 'local' },
-      defaultCwd: process.cwd(),
+      defaultCwd: tempDir,
       defaultPolicy: 'auto-edit',
       defaultSessionMode: 'persistent',
       env: {
+        CLAUDE_CONFIG_DIR: claudeDir,
         MOCK_CLAUDE_LOG: claudeLog,
         MOCK_TMUX_LOG: tmuxLog,
         MOCK_TMUX_SESSION: path.join(tempDir, 'session'),
@@ -525,18 +619,15 @@ test('Claude Code tmux replies resume through TaskManager after restart', async 
     assert.equal(second.metrics.turnCount, 2);
     assert.equal(second.metrics.costUsd, 0.024);
     assert.equal(second.tmuxSession, first.tmuxSession);
-    const claudeCalls = fs.readFileSync(claudeLog, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-    assert.equal(claudeCalls.length, 2);
-    assert.equal(claudeCalls[1][claudeCalls[1].indexOf('--resume') + 1], first.sessionId);
-    assert.equal(claudeCalls[1][claudeCalls[1].indexOf('-p') + 1], 'Second turn');
     const tmuxCalls = fs.readFileSync(tmuxLog, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
     assert.equal(tmuxCalls.filter((call) => call[0] === 'new-session').length, 1);
+    assert.equal(tmuxCalls.filter((call) => call[0] === 'paste-buffer').length, 2);
 
     const interrupted = await restartedManager.steer(first.taskId, { action: 'interrupt' });
     assert.equal(interrupted.status, 'aborted');
     assert.equal(interrupted.stopReason, 'aborted');
     const finalTmuxCalls = fs.readFileSync(tmuxLog, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-    assert.deepEqual(finalTmuxCalls.at(-1).slice(-2), [`=${first.tmuxSession}`, 'C-c']);
+    assert.deepEqual(finalTmuxCalls.at(-1).slice(-2), [`=${first.tmuxSession}`, 'Escape']);
   } finally {
     for (const key of traceKeys) {
       if (inheritedTrace[key] === undefined) delete process.env[key];
@@ -550,7 +641,7 @@ test('TaskManager registers Claude Code driver modes and kind fallback', () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-claude-registry-'));
   try {
     const manager = new TaskManager({ stateDir });
-    for (const driverName of ['claude-tmux', 'claude-print', 'claude-cli', 'custom']) {
+    for (const driverName of ['claude-tmux', 'claude-cli', 'custom']) {
       assert.ok(manager.getDriver({
         id: `claude-${driverName}`,
         kind: 'claude-code',

@@ -80,7 +80,7 @@ Before delegating, choose the appropriate session lifecycle so you neither lose 
 | Mode | CLI Flag | When to Use (Recommended) | Native Harness Behavior |
 | :--- | :--- | :--- | :--- |
 | **`persistent`** *(First-Class User Session)* | `--persistent` *(default for `--preset task` & `rescue`)* | **Substantial, iterative, or multi-turn engineering work**: feature implementation, multi-file refactoring, deep debugging, or tasks the human user may want to inspect and continue themselves in the target Harness. | Saved directly to the user's default session store (`~/.claude/projects`, `~/.codex/sessions`, `~/.dsh`). Visible in native session lists and resumable via `reins steer`, `claude --resume`, or `codex resume`. |
-| **`ephemeral`** *(Burn-After-Reading / One-Shot)* | `--ephemeral` *(or `--one-shot`; default for `--preset review` & `adversarial-review`)* | **Granular, export, or one-off tasks**: data export/formatting, quick file summaries, single-pass code reviews, isolated helper generation, or high-frequency parallel queries that would otherwise dilute the user's valuable session history. | Runs with native ephemeral/isolated settings (`ephemeral: true` in Codex, `persistSession: false` in Claude SDK, isolated home in DSH) and cleans up immediately upon completion without polluting the user's session list. |
+| **`ephemeral`** *(Burn-After-Reading / One-Shot)* | `--ephemeral` *(or `--one-shot`; default for `--preset review` & `adversarial-review`)* | **Granular, export, or one-off tasks**: data export/formatting, quick file summaries, single-pass code reviews, isolated helper generation, or high-frequency parallel queries that would otherwise dilute the user's valuable session history. | Runs with native ephemeral/isolated settings (`ephemeral: true` in Codex, temporary `tmux` session + scratch `.jsonl` cleanup in Claude Code, isolated home in DSH) and cleans up immediately upon completion without polluting the user's session list. |
 
 ---
 
@@ -210,9 +210,11 @@ targets:
       sshHost: <ssh-config-alias>    # Host alias in ~/.ssh/config or user@host (omit for local)
       connectTimeoutSec: 20
     driver:
-      mode: claude-tmux              # codex-app-server | agentapi | acp | dsh-headless | claude-tmux | claude-print
+      mode: claude-tmux              # codex-app-server | agentapi | acp | dsh-headless | claude-tmux
       binaryPath: /usr/local/bin/claude
       tmuxPrefix: reins-cc
+      paneCols: 140
+      paneRows: 45
     workspace:
       defaultWorkdir: /workspace/project
       allowedSyncModes: [remote-native, context-only]
@@ -239,9 +241,12 @@ Reins' Southbound Drivers (`src/drivers/*.js`) are intentionally **thin, version
 | Harness (`harnessType`) | Driver Mode (`driver.mode`) | Standard Invocation Primitive |
 | :--- | :--- | :--- |
 | **`codex`** | `codex-app-server` | Standard JSON-RPC 2.0 over `<command> app-server --stdio` (`initialize` $\rightarrow$ `thread/start` / `thread/resume` $\rightarrow$ `turn/start`). Gracefully falls back to `cwd` project binding if the installed `codex` version does not implement `project/list`. |
-| **`claude-code`** | `claude-print` / `claude-tmux` | Standard JSONL stream over `<command> -p <prompt> --output-format stream-json --verbose [--resume <id>]`. When `claude-tmux` is selected for persistent sessions, attaches/resumes a detached `tmux` session (`tmux new-session -d -s <name> "<claude> --resume <id>"`). |
+| **`claude-code`** | `claude-tmux` | Interactive `tmux` session (`tmux new-session -d -s <name> -c <cwd> "<claude> --session-id <uuid>"` for new sessions or `"<claude> --resume <uuid>"` for existing transcripts) + Bracketed Paste prompt submission (`tmux load-buffer` $\rightarrow$ `tmux paste-buffer -p` $\rightarrow$ `tmux send-keys Enter`) + structured transcript folding (`~/.claude/projects/<slug>/<uuid>.jsonl`) + `tmux capture-pane -p` readiness/dialog detection (`Enter` to approve, `Escape` to reject/interrupt). **Never uses `claude -p` (`--print`).** |
 | **`dsh`** | `acp` / `dsh-headless` | Standard ACP JSON-RPC 2.0 over `<command> --profile acp` (`initialize` $\rightarrow$ `session/new` / `session/load` $\rightarrow$ `session/prompt`) or JSONL stream over `<command> --profile headless --json`. |
 | **`antigravity`** | `agy-cli` / `antigravity-sdk` | Standard CLI invocation over `<command> --prompt <prompt> [--ephemeral | --conversation <id>]`. |
+
+> **Strict Rule for Claude Code (`claude-code` / `claude-tmux`) — Never Use `claude -p`**:  
+> Never invoke `claude -p`, `--print`, `--output-format stream-json`, or `--no-session-persistence` directly or in target `args`. Claude Code must always be driven interactively inside a `tmux` session (`--session-id <uuid>` on initial launch, `--resume <uuid>` when resuming an existing transcript, `tmux paste-buffer -p` for multiline input, and `~/.claude/projects/<slug>/<uuid>.jsonl` + `tmux capture-pane -p` for output and dialog tracking).
 
 ### Self-Healing When a User Has a Different Harness Version Installed
 Because different users install different versions of `codex`, `claude`, `dsh`, or `agy` (or use custom wrappers/install paths), a target CLI may reject a flag or require custom arguments/environment variables:

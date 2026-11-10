@@ -83,9 +83,9 @@ Every driver implements the unified driver contract: `startSession()`, `sendTurn
    - Drives local or remote Antigravity CLI / headless & ACP workflows.
 3. **Priority 3: `dsh-driver.js` (DeepSeek Harness `dsh` Driver)**:
    - Drives `dsh --profile acp` (via Agent Client Protocol NDJSON stdio) and `dsh --profile sdk`, supporting both user-default `~/.dsh` persistent sessions and isolated ephemeral runs.
-4. **Priority 4: `claude-tmux.js` & `claude-sdk.js` (Claude Code Drivers)**:
-   - `claude-tmux.js`: Interactive `tmux` + Bracketed Paste + `~/.claude/projects/<slug>/<uuid>.jsonl` watcher + `capture-pane` permission dialog detector (reusing verified rules from `../dsh-claude-vps`).
-   - `claude-sdk.js`: Stream-JSON / Agent SDK driver with `persistSession: true | false` support.
+4. **Priority 4: `claude-code-driver.js` (Interactive `claude-tmux` Driver)**:
+   - Drives Claude Code strictly interactively inside a detached `tmux` session (`claude --session-id <uuid>` / `claude --resume <uuid>`, never `claude -p` or `--print`).
+   - Uses `tmux load-buffer` + `tmux paste-buffer -p` (bracketed paste) + `tmux send-keys Enter` for prompt delivery, tails `~/.claude/projects/<slug>/<uuid>.jsonl` for structured output/thinking/tool events, and inspects `tmux capture-pane -p` for readiness and interactive permission/trust dialogs (reusing verified rules from `../dsh-claude-vps`).
 
 ---
 

@@ -113,10 +113,18 @@ test('Docker & Live E2E: Claude Code persistent multi-turn session & caller rule
         targets: {
           'test-local-claude': {
             kind: 'claude-code',
-            driver: 'claude-print',
+            driver: 'claude-tmux',
             transport: { type: 'local' },
             command: process.execPath,
             args: [AGENT_SCRIPT],
+            tmuxCommand: process.execPath,
+            tmuxArgs: [path.resolve('tests/fixtures/mock-tmux.mjs')],
+            pollIntervalMs: 30,
+            pasteDelayMs: 10,
+            env: {
+              CLAUDE_CONFIG_DIR: path.join(tempStateDir, '.claude'),
+              MOCK_TMUX_SESSION: path.join(tempStateDir, 'session.json'),
+            },
             model: TEST_MODEL,
             defaultCwd: process.cwd(),
             defaultPolicy: 'auto-edit',

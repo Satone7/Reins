@@ -66,7 +66,7 @@ targets:
     reinPolicy: auto-edit
     tags: [test, ssh, dsh]
 
-  # 4. Remote Container SSH Claude Code (SSH + Tmux + Stream-JSON — powered by deepseek-flash)
+  # 4. Remote Container SSH Claude Code (SSH + Interactive Tmux + JSONL Transcript — powered by deepseek-flash)
   - id: test-ssh-claude
     label: Test Remote SSH Claude Code (Tmux)
     harnessType: claude-code

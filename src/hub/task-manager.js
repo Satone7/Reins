@@ -89,7 +89,6 @@ export class TaskManager {
         driver = new DshDriver(target);
         break;
       case 'claude-tmux':
-      case 'claude-print':
       case 'claude-cli':
         driver = new ClaudeCodeDriver(target);
         break;

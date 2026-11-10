@@ -227,12 +227,13 @@ export function discoverLocalHarnesses(options = {}) {
       detectionSource: claudeSource,
       suggestedTarget: {
         id: 'local-claude',
-        label: 'Local Claude Code CLI',
+        label: 'Local Claude Code CLI (tmux)',
         harnessType: 'claude-code',
         transport: { kind: 'local' },
         driver: {
-          mode: 'claude-print',
+          mode: 'claude-tmux',
           command: 'auto',
+          tmuxPrefix: 'reins-cc',
           args: [],
         },
         workspace: {
