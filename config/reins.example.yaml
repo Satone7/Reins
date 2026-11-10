@@ -54,7 +54,7 @@ targets:
     transport:
       kind: local
     driver:
-      mode: agentapi
+      mode: agy-cli
       command: auto
       args: []
     model: flash_lite

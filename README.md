@@ -17,6 +17,8 @@ Reins is built around a strict separation between **Agent-hosted workflow orches
    The `reins` executable provides only non-interactive, structured JSON (`--json`) atomic primitives that the Agent invokes behind the scenes:
    - **Environment & Config Primitives**: `reins discover --json`, `reins probe-ssh <host> --json`, `reins sync-skills --json`, `reins targets --json`, `reins models <target> --json`
    - **H2H Task Lifecycle Primitives**: `reins delegate`, `reins status`, `reins steer`, `reins abort`
+4. **Thin, Version-Agnostic Southbound Drivers & Agent Self-Healing (薄驱动原语与跨版本自愈)**  
+   Southbound drivers (`src/drivers/*.js`) use only standard, public protocol and CLI streaming primitives (`JsonRpcStdioTransport` and `runStreamingProcess`)—never mutating private SQLite databases, scraping internal credential files, or polling undocumented log paths. If a user's installed Harness version rejects a CLI flag, Reins returns the exact `commandLine`, `exitCode`, and `stderr` so the hosting Agent can inspect `<harness> --help` / `--version`, update `~/.reins/config.yaml`, and self-heal.
 
 ---
 

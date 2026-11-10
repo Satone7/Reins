@@ -83,7 +83,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     'local-agy': {
       id: 'local-agy',
       kind: 'antigravity',
-      driver: 'agentapi',
+      driver: 'agy-cli',
       transport: { type: 'local' },
       command: 'auto',
       args: [],
