@@ -79,40 +79,24 @@ export function discoverLocalHarnesses(options = {}) {
   // 2. Antigravity (`local-agy`)
   const agyHome = path.join(home, '.gemini', 'antigravity');
   const agyHomeExists = fs.existsSync(agyHome);
-  const agentApiBat = path.join(
-    agyHome,
-    'bin',
-    platform === 'win32' ? 'agentapi.bat' : 'agentapi',
-  );
-  const winLangServer =
-    platform === 'win32' && env.LOCALAPPDATA
-      ? path.join(env.LOCALAPPDATA, 'Programs', 'antigravity', 'resources', 'bin', 'language_server.exe')
-      : null;
   const winAgyExe =
     platform === 'win32' && env.LOCALAPPDATA
       ? path.join(env.LOCALAPPDATA, 'Programs', 'antigravity', 'Antigravity.exe')
       : null;
-  const agyOnPath = lookupBinary('agy') || lookupBinary('agentapi');
+  const agyOnPath = lookupBinary('agy');
   const agyBinary =
-    (fs.existsSync(agentApiBat) ? agentApiBat : null) ||
     agyOnPath ||
-    (winLangServer && fs.existsSync(winLangServer) ? winLangServer : null) ||
     (winAgyExe && fs.existsSync(winAgyExe) ? winAgyExe : null) ||
     null;
-  const agyDetected = Boolean(agyBinary);
-  const agyDriverMode =
-    fs.existsSync(agentApiBat) || (winLangServer && fs.existsSync(winLangServer))
-      ? 'agentapi'
-      : 'agy-cli';
-  const agySource = fs.existsSync(agentApiBat)
-    ? 'agentapi'
-    : agyOnPath
-      ? 'PATH'
-      : agyBinary
-        ? 'App Install'
-        : agyHomeExists
-          ? '~/.gemini/antigravity exists (binary not found)'
-          : 'not-found';
+  const agyDetected = Boolean(agyBinary || agyHomeExists);
+  const agyDriverMode = 'agy-cli';
+  const agySource = agyOnPath
+    ? 'PATH'
+    : agyBinary
+      ? 'App Install'
+      : agyHomeExists
+        ? '~/.gemini/antigravity'
+        : 'not-found';
 
   // 3. DeepSeek Harness (`local-dsh`)
   const dshHome = path.join(home, '.dsh');

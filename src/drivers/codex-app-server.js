@@ -1,22 +1,15 @@
 /**
  * Reins Southbound Driver — OpenAI Codex (`codex app-server --stdio`)
  *
- * Implements the full H2H Protocol v0.2 lifecycle over Codex's native JSON-RPC 2.0
- * `app-server` protocol, supporting:
- * - First-class persistent sessions (`ephemeral: false` -> saved in `~/.codex/sessions/`)
- * - Burn-after-reading ephemeral sessions (`ephemeral: true` -> in-memory / no session clutter)
- * - Session resumption via `thread/resume`
- * - Streaming item deltas, commentary, and final agent messages
- * - Interactive approval interception (`attention_required`) and live turn steering
+ * Thin, version-agnostic JSON-RPC 2.0 driver over Codex's standard `app-server --stdio`
+ * protocol. Avoids mutating private SQLite databases (`state_5.sqlite`, `codex.db`),
+ * internal rollout files, or undocumented Electron IPC sockets so it remains compatible
+ * across different Codex CLI versions.
  */
 
 import fs from 'node:fs';
-import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { DatabaseSync } from 'node:sqlite';
 import { resolveExecutable } from '../transports/local.js';
 import { createJsonRpcTransport } from '../transports/ssh.js';
 import {
@@ -27,7 +20,7 @@ import {
 } from '../protocol/schema.js';
 
 /**
- * Derives a concise, human-readable thread title for Codex Desktop from a prompt.
+ * Derives a concise, human-readable thread title from a prompt.
  *
  * @param {string} prompt
  * @param {object} [snapshot={}]
@@ -50,138 +43,8 @@ export function deriveCodexThreadTitle(prompt, snapshot = {}) {
 }
 
 /**
- * Encodes a length-prefixed JSON frame for the local Codex Desktop IPC router.
- *
- * @param {object} payload
- * @returns {Buffer}
- */
-function encodeCodexIpcFrame(payload) {
-  const json = JSON.stringify(payload);
-  const byteLength = Buffer.byteLength(json, 'utf8');
-  const frame = Buffer.alloc(4 + byteLength);
-  frame.writeUInt32LE(byteLength, 0);
-  frame.write(json, 4, 'utf8');
-  return frame;
-}
-
-/**
- * Broadcasts a thread update over the local Codex Desktop IPC bus (`\\.\pipe\codex-ipc`
- * on Windows or `~/.codex/ipc/ipc.sock` on Unix) so a running Codex Desktop window
- * immediately hydrates and surfaces the thread without requiring an app restart.
- *
- * @param {object} options
- * @param {string} options.threadId
- * @param {string} [options.codexHome]
- * @param {number} [options.timeoutMs=1200]
- * @returns {Promise<boolean>} True if a running Codex Desktop IPC router accepted the broadcast
- */
-export async function notifyCodexDesktopIpc({ threadId, codexHome, timeoutMs = 1200 }) {
-  if (!threadId) return false;
-  const endpoint =
-    process.platform === 'win32'
-      ? '\\\\.\\pipe\\codex-ipc'
-      : path.join(codexHome || path.join(os.homedir(), '.codex'), 'ipc', 'ipc.sock');
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let buffer = Buffer.alloc(0);
-    const initRequestId = randomUUID();
-
-    const finish = (ok, socket) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        socket?.end();
-        socket?.destroy();
-      } catch {
-        // Ignore socket teardown errors.
-      }
-      resolve(ok);
-    };
-
-    const timer = setTimeout(() => finish(false, null), timeoutMs);
-    timer.unref?.();
-
-    let socket;
-    try {
-      socket = net.connect(endpoint, () => {
-        try {
-          socket.write(
-            encodeCodexIpcFrame({
-              type: 'request',
-              requestId: initRequestId,
-              sourceClientId: 'initializing-client',
-              version: 0,
-              method: 'initialize',
-              params: { clientType: 'cli' },
-            }),
-          );
-        } catch {
-          finish(false, socket);
-        }
-      });
-    } catch {
-      finish(false, null);
-      return;
-    }
-
-    socket.on('error', () => finish(false, socket));
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      while (buffer.length >= 4) {
-        const frameLen = buffer.readUInt32LE(0);
-        if (frameLen === 0 || frameLen > 0x1000000) {
-          finish(false, socket);
-          return;
-        }
-        if (buffer.length < 4 + frameLen) return;
-        const rawJson = buffer.subarray(4, 4 + frameLen).toString('utf8');
-        buffer = buffer.subarray(4 + frameLen);
-        let msg;
-        try {
-          msg = JSON.parse(rawJson);
-        } catch {
-          continue;
-        }
-        if (msg?.type === 'response' && msg?.requestId === initRequestId) {
-          const clientId = msg?.result?.clientId || 'reins-h2h-client';
-          try {
-            const unarchiveFrame = encodeCodexIpcFrame({
-              type: 'broadcast',
-              method: 'thread-unarchived',
-              sourceClientId: clientId,
-              params: {
-                hostId: 'local',
-                conversationId: threadId,
-              },
-              version: 1,
-            });
-            const invalidateFrame = encodeCodexIpcFrame({
-              type: 'broadcast',
-              method: 'query-cache-invalidate',
-              sourceClientId: clientId,
-              params: {
-                queryKey: [],
-              },
-              version: 1,
-            });
-            socket.write(Buffer.concat([unarchiveFrame, invalidateFrame]), () =>
-              finish(true, socket),
-            );
-          } catch {
-            finish(false, socket);
-          }
-          return;
-        }
-      }
-    });
-  });
-}
-
-/**
  * Strips the Windows extended-length path prefix (`\\?\` and `\\?\UNC\`) produced by
- * Rust `std::fs::canonicalize` so paths match Codex Desktop's Electron path normalization.
+ * Rust `std::fs::canonicalize`.
  *
  * @param {string} rawPath
  * @returns {string}
@@ -219,369 +82,11 @@ export function resolveGitWorktreeRoot(targetCwd) {
   }
 }
 
-/**
- * Checks whether a workspace path is already registered in Codex Desktop's `local-projects`,
- * selecting the most specific (longest) matching project root.
- *
- * @param {Record<string, any>} localProjects
- * @param {string} targetCwd
- * @returns {string | null} Matching projectId if found
- */
-function findMatchingCodexProjectId(localProjects, targetCwd) {
-  if (!localProjects || typeof localProjects !== 'object' || !targetCwd) return null;
-  const normTarget = path.resolve(normalizeCodexPath(targetCwd)).replace(/[\\/]+$/, '').toLowerCase();
-  let bestId = null;
-  let bestLen = -1;
-  for (const [projectId, proj] of Object.entries(localProjects)) {
-    const roots = Array.isArray(proj?.rootPaths) ? proj.rootPaths : [];
-    for (const root of roots) {
-      const normRoot = path.resolve(normalizeCodexPath(root)).replace(/[\\/]+$/, '').toLowerCase();
-      if (normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`)) {
-        if (normRoot.length > bestLen) {
-          bestLen = normRoot.length;
-          bestId = projectId;
-        }
-      }
-    }
-  }
-  return bestId;
-}
-
-/**
- * Ensures `cwd` is marked as trusted in `~/.codex/config.toml` so Codex Desktop can
- * register the workspace folder without blocking on an interactive trust prompt.
- *
- * @param {string} codexHome
- * @param {string} cwd
- */
-function ensureCodexConfigTrustedProject(codexHome, cwd) {
-  try {
-    const configPath = path.join(codexHome, 'config.toml');
-    if (!fs.existsSync(configPath) || !cwd) return;
-    const raw = fs.readFileSync(configPath, 'utf8');
-    const resolved = path.resolve(normalizeCodexPath(cwd));
-    const lower = resolved.toLowerCase();
-    const candidates = [resolved];
-    if (lower !== resolved) candidates.push(lower);
-    let appended = '';
-    for (const candidate of candidates) {
-      if (!raw.includes(`[projects.'${candidate}']`) && !raw.includes(`[projects."${candidate}"]`)) {
-        appended += `\n[projects.'${candidate}']\ntrust_level = "trusted"\n`;
-      }
-    }
-    if (appended) {
-      fs.appendFileSync(configPath, appended, 'utf8');
-    }
-  } catch {
-    // Non-fatal best-effort config update.
-  }
-}
-
-/**
- * Synchronizes a persistent Codex session into Codex Desktop's SQLite catalog
- * (`~/.codex/state_5.sqlite`, `~/.codex/sqlite/codex.db`, and `~/.codex/session_index.jsonl`)
- * and notifies any running Codex Desktop instance so the session appears in the sidebar.
- *
- * @param {object} options
- * @param {string} options.threadId
- * @param {string} [options.cwd]
- * @param {string} [options.title]
- * @param {string} [options.codexHome]
- * @param {boolean} [options.notifyRunningDesktop=true]
- * @returns {Promise<{ syncedStateDb: boolean, syncedCatalogDb: boolean, ipcNotified: boolean }>}
- */
-export async function syncCodexDesktopCatalog({
-  threadId,
-  cwd,
-  title,
-  projectId = null,
-  codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
-  notifyRunningDesktop = true,
-}) {
-  const result = {
-    syncedStateDb: false,
-    syncedCatalogDb: false,
-    ipcNotified: false,
-    projectId: projectId || null,
-  };
-  if (!threadId || !codexHome) return result;
-
-  const effectiveCwd = normalizeCodexPath(cwd ? path.resolve(normalizeCodexPath(cwd)) : process.cwd());
-  const effectiveTitle = (title && String(title).trim()) || `[Reins] ${threadId}`;
-  const nowSec = Math.floor(Date.now() / 1000);
-  let threadRow = null;
-
-  // 1. Update `~/.codex/state_5.sqlite` (`threads` table and `project_roots` lookup)
-  let serverProjectId = projectId || null;
-  const stateDbPath = path.join(codexHome, 'state_5.sqlite');
-  if (fs.existsSync(stateDbPath)) {
-    let stateDb = null;
-    try {
-      stateDb = new DatabaseSync(stateDbPath);
-      stateDb.exec('PRAGMA busy_timeout = 3000;');
-
-      const existingRow = stateDb
-        .prepare(`SELECT cwd, project_id FROM threads WHERE id = ?`)
-        .get(threadId);
-      const normalizedCwd = normalizeCodexPath(existingRow?.cwd || effectiveCwd);
-
-      try {
-        const projectRoots = stateDb
-          .prepare(`SELECT project_id, path FROM project_roots`)
-          .all();
-        const normTarget = path.resolve(normalizedCwd).replace(/[\\/]+$/, '').toLowerCase();
-        let bestLen = -1;
-        for (const pr of projectRoots) {
-          const normRoot = path
-            .resolve(normalizeCodexPath(pr.path))
-            .replace(/[\\/]+$/, '')
-            .toLowerCase();
-          if (normTarget === normRoot || normTarget.startsWith(`${normRoot}${path.sep}`)) {
-            if (normRoot.length > bestLen) {
-              bestLen = normRoot.length;
-              serverProjectId = pr.project_id;
-            }
-          }
-        }
-        if (!serverProjectId) {
-          const newProjId = randomUUID();
-          const nowMs = Date.now();
-          const maxPosRow = stateDb.prepare(`SELECT COALESCE(MAX(position), -1) AS maxPos FROM projects`).get();
-          const nextPos = (Number(maxPosRow?.maxPos) || 0) + 1;
-          const projName = path.basename(normalizedCwd) || 'Workspace';
-          stateDb
-            .prepare(
-              `INSERT INTO projects (id, name, metadata, position, created_at_ms, updated_at_ms)
-               VALUES (?, ?, '{}', ?, ?, ?)`,
-            )
-            .run(newProjId, projName, nextPos, nowMs, nowMs);
-          stateDb
-            .prepare(
-              `INSERT INTO project_roots (project_id, position, path)
-               VALUES (?, 0, ?)`,
-            )
-            .run(newProjId, normalizedCwd);
-          serverProjectId = newProjId;
-        }
-      } catch {
-        // Ignore if `project_roots` table is not present on older Codex versions.
-      }
-
-      stateDb
-        .prepare(
-          `UPDATE threads
-              SET originator = 'Codex Desktop',
-                  thread_source = 'user',
-                  cwd = ?,
-                  project_id = COALESCE(?, project_id),
-                  title = CASE
-                    WHEN title IS NULL OR TRIM(title) = '' THEN ?
-                    ELSE title
-                  END,
-                  name = CASE
-                    WHEN name IS NULL OR TRIM(name) = '' THEN ?
-                    ELSE name
-                  END
-            WHERE id = ?`,
-        )
-        .run(normalizedCwd, serverProjectId, effectiveTitle, effectiveTitle, threadId);
-
-      threadRow = stateDb
-        .prepare(
-          `SELECT id, created_at, updated_at, cwd, source, model_provider, git_branch, title, name, rollout_path, project_id
-             FROM threads
-            WHERE id = ?`,
-        )
-        .get(threadId);
-      serverProjectId = threadRow?.project_id || serverProjectId;
-      result.projectId = serverProjectId;
-      result.syncedStateDb = Boolean(threadRow);
-    } catch {
-      // Ignore SQLite contention or schema differences.
-    } finally {
-      try {
-        stateDb?.close();
-      } catch {
-        // Ignore close errors.
-      }
-    }
-  }
-
-  // Also patch the rollout JSONL file's `session_meta.payload.originator` if it is 'reins'
-  if (threadRow?.rollout_path) {
-    try {
-      const rolloutPath = normalizeCodexPath(threadRow.rollout_path);
-      if (fs.existsSync(rolloutPath)) {
-        const rawRollout = fs.readFileSync(rolloutPath, 'utf8');
-        if (rawRollout.includes('"originator":"reins"')) {
-          const patchedRollout = rawRollout.replace(
-            '"originator":"reins"',
-            '"originator":"Codex Desktop"',
-          );
-          fs.writeFileSync(rolloutPath, patchedRollout, 'utf8');
-        }
-      }
-    } catch {
-      // Non-fatal rollout metadata patch.
-    }
-  }
-
-  const displayTitle =
-    (threadRow?.name && String(threadRow.name).trim()) ||
-    (threadRow?.title && String(threadRow.title).trim()) ||
-    effectiveTitle;
-  const sourceCreatedAt = Number.isFinite(threadRow?.created_at) ? threadRow.created_at : nowSec;
-  const sourceUpdatedAt = Number.isFinite(threadRow?.updated_at) ? threadRow.updated_at : nowSec;
-  const rowCwd = normalizeCodexPath(threadRow?.cwd || effectiveCwd);
-  const modelProvider = threadRow?.model_provider || 'openai';
-  const gitBranch = threadRow?.git_branch || null;
-
-  // 2. Upsert into `~/.codex/sqlite/codex.db` (`local_thread_catalog` table)
-  const catalogDbPath = path.join(codexHome, 'sqlite', 'codex.db');
-  if (fs.existsSync(catalogDbPath)) {
-    let catalogDb = null;
-    try {
-      catalogDb = new DatabaseSync(catalogDbPath);
-      catalogDb.exec('PRAGMA busy_timeout = 3000;');
-
-      const syncState = catalogDb
-        .prepare(
-          `SELECT observation_sequence, watermark_updated_at
-             FROM local_thread_catalog_sync_state
-            WHERE host_id = 'local'`,
-        )
-        .get();
-      const nextObsSeq = (Number(syncState?.observation_sequence) || 0) + 1;
-      const nextWatermark = Math.max(Number(syncState?.watermark_updated_at) || 0, sourceUpdatedAt);
-
-      catalogDb
-        .prepare(
-          `INSERT INTO local_thread_catalog (
-             host_id, thread_id, display_title, source_created_at, source_updated_at,
-             cwd, source_kind, source_detail, model_provider, git_branch,
-             observation_sequence, missing_candidate, thread_source, source_recency_at,
-             pending_observed_title, project_id
-           ) VALUES (
-             'local', ?, ?, ?, ?,
-             ?, 'vscode', NULL, ?, ?,
-             ?, 0, 'user', ?,
-             0, ?
-           )
-           ON CONFLICT(host_id, thread_id) DO UPDATE SET
-             display_title = excluded.display_title,
-             source_updated_at = excluded.source_updated_at,
-             source_recency_at = excluded.source_recency_at,
-             cwd = excluded.cwd,
-             source_kind = 'vscode',
-             thread_source = 'user',
-             missing_candidate = 0,
-             observation_sequence = excluded.observation_sequence,
-             project_id = COALESCE(excluded.project_id, local_thread_catalog.project_id)`,
-        )
-        .run(
-          threadId,
-          displayTitle,
-          sourceCreatedAt,
-          sourceUpdatedAt,
-          rowCwd,
-          modelProvider,
-          gitBranch,
-          nextObsSeq,
-          sourceUpdatedAt,
-          serverProjectId,
-        );
-
-      catalogDb
-        .prepare(
-          `UPDATE local_thread_catalog_sync_state
-              SET observation_sequence = ?,
-                  watermark_updated_at = ?
-            WHERE host_id = 'local'`,
-        )
-        .run(nextObsSeq, nextWatermark);
-
-      catalogDb
-        .prepare(
-          `UPDATE local_thread_catalog_metadata
-              SET catalog_revision = catalog_revision + 1
-            WHERE id = 1`,
-        )
-        .run();
-
-      result.syncedCatalogDb = true;
-    } catch {
-      // Ignore if catalog table does not exist.
-    } finally {
-      try {
-        catalogDb?.close();
-      } catch {
-        // Ignore close errors.
-      }
-    }
-  }
-
-  // 3. Ensure `~/.codex/session_index.jsonl` contains the thread entry
-  try {
-    const indexPath = path.join(codexHome, 'session_index.jsonl');
-    let alreadyPresent = false;
-    if (fs.existsSync(indexPath)) {
-      const existing = fs.readFileSync(indexPath, 'utf8');
-      alreadyPresent = existing.includes(`"id":"${threadId}"`);
-    }
-    if (!alreadyPresent) {
-      fs.appendFileSync(
-        indexPath,
-        `${JSON.stringify({
-          id: threadId,
-          thread_name: displayTitle,
-          updated_at: new Date(sourceUpdatedAt * 1000).toISOString(),
-        })}\n`,
-        'utf8',
-      );
-    }
-  } catch {
-    // Non-fatal index append.
-  }
-
-  // 4. Notify running Codex Desktop instance (if any) and ensure project root visibility
-  if (notifyRunningDesktop) {
-    ensureCodexConfigTrustedProject(codexHome, rowCwd);
-    result.ipcNotified = await notifyCodexDesktopIpc({ threadId, codexHome });
-
-    const globalStatePath = path.join(codexHome, '.codex-global-state.json');
-    if (!result.ipcNotified && fs.existsSync(globalStatePath)) {
-      try {
-        const globalState = JSON.parse(fs.readFileSync(globalStatePath, 'utf8'));
-        const localProjects = globalState['local-projects'] || {};
-        const matchedProjectId = findMatchingCodexProjectId(localProjects, rowCwd);
-
-        if (!matchedProjectId) {
-          const newProjectId = serverProjectId || randomUUID();
-          const nowMs = Date.now();
-          localProjects[newProjectId] = {
-            id: newProjectId,
-            name: path.basename(rowCwd) || 'Workspace',
-            rootPaths: [rowCwd],
-            createdAt: nowMs,
-            updatedAt: nowMs,
-          };
-          globalState['local-projects'] = localProjects;
-          const projectOrder = Array.isArray(globalState['project-order'])
-            ? globalState['project-order']
-            : [];
-          if (!projectOrder.includes(newProjectId)) {
-            globalState['project-order'] = [newProjectId, ...projectOrder];
-          }
-          globalState['selected-project'] = { type: 'local', projectId: newProjectId };
-          fs.writeFileSync(globalStatePath, JSON.stringify(globalState), 'utf8');
-        }
-      } catch {
-        // Ignore global state parse/write errors.
-      }
-    }
-  }
-
-  return result;
+function isMethodNotFound(err) {
+  return (
+    err?.code === -32601 ||
+    /method not found|unknown variant|unsupported/i.test(String(err?.message || ''))
+  );
 }
 
 export class CodexAppServerDriver {
@@ -595,8 +100,8 @@ export class CodexAppServerDriver {
   }
 
   /**
-   * Queries `codex app-server --stdio` for all selectable models, their supported
-   * reasoning efforts, and the current user-configured defaults.
+   * Queries `codex app-server --stdio` for selectable models, supported reasoning
+   * efforts, and current defaults.
    *
    * @param {object} [options]
    * @param {string} [options.cwd]
@@ -608,11 +113,14 @@ export class CodexAppServerDriver {
     const transportConfig = this.targetConfig.transport;
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
     const command = isSsh
-      ? (this.targetConfig.command && this.targetConfig.command !== 'auto' ? this.targetConfig.command : 'codex')
+      ? this.targetConfig.command && this.targetConfig.command !== 'auto'
+        ? this.targetConfig.command
+        : 'codex'
       : resolveExecutable(this.targetConfig.command || 'auto', 'codex');
-    const args = Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
-      ? this.targetConfig.args
-      : ['app-server', '--stdio'];
+    const args =
+      Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
+        ? this.targetConfig.args
+        : ['app-server', '--stdio'];
 
     const transport = createJsonRpcTransport({
       transportConfig,
@@ -676,10 +184,7 @@ export class CodexAppServerDriver {
         kind: 'codex',
         currentConfig: {
           model: this.targetConfig.model || userConfig.model || null,
-          effort:
-            this.targetConfig.effort ||
-            userConfig.model_reasoning_effort ||
-            null,
+          effort: this.targetConfig.effort || userConfig.model_reasoning_effort || null,
           provider: userConfig.model_provider || null,
         },
         models,
@@ -690,26 +195,33 @@ export class CodexAppServerDriver {
   }
 
   /**
-   * Ensures `effectiveProjectRoot` is registered as a first-class project in `codex app-server`
-   * via `project/list` and `project/create`, selecting the most-specific matching project root
-   * and returning its `projectId`.
+   * Registers `effectiveProjectRoot` via standard `project/list` and `project/create` RPCs
+   * when supported by the target `codex app-server` version.
    *
    * @param {object} transport
    * @param {string} effectiveProjectRoot
    * @param {boolean} [isSsh=false]
-   * @returns {Promise<string | null>}
+   * @returns {Promise<{ projectId: string | null, rpcSupported: boolean }>}
    */
   async _ensureCodexProject(transport, effectiveProjectRoot, isSsh = false) {
-    if (!effectiveProjectRoot) return null;
+    if (!effectiveProjectRoot) return { projectId: null, rpcSupported: false };
     const normPath = (p) =>
       isSsh
         ? String(p || '').replace(/\/+$/, '')
         : path.resolve(normalizeCodexPath(p)).replace(/[\\/]+$/, '').toLowerCase();
 
     const targetNorm = normPath(effectiveProjectRoot);
-    const listRes = await transport.request('project/list', {}, 10000);
-    const projects = Array.isArray(listRes?.data) ? listRes.data : [];
+    let listRes;
+    try {
+      listRes = await transport.request('project/list', {}, 10000);
+    } catch (err) {
+      if (isMethodNotFound(err)) {
+        return { projectId: null, rpcSupported: false };
+      }
+      throw err;
+    }
 
+    const projects = Array.isArray(listRes?.data) ? listRes.data : [];
     let bestId = null;
     let bestLen = -1;
     const sep = isSsh ? '/' : path.sep;
@@ -728,22 +240,29 @@ export class CodexAppServerDriver {
       }
     }
     if (bestId && bestLen === targetNorm.length) {
-      return bestId;
+      return { projectId: bestId, rpcSupported: true };
     }
 
     const projName =
       (isSsh ? path.posix.basename(effectiveProjectRoot) : path.basename(effectiveProjectRoot)) ||
       'Workspace';
-    const createdRes = await transport.request(
-      'project/create',
-      {
-        idempotencyKey: randomUUID(),
-        name: projName,
-        roots: [{ path: effectiveProjectRoot }],
-      },
-      10000,
-    );
-    return createdRes?.project?.id || bestId || null;
+    try {
+      const createdRes = await transport.request(
+        'project/create',
+        {
+          idempotencyKey: randomUUID(),
+          name: projName,
+          roots: [{ path: effectiveProjectRoot }],
+        },
+        10000,
+      );
+      return { projectId: createdRes?.project?.id || bestId || null, rpcSupported: true };
+    } catch (err) {
+      if (isMethodNotFound(err)) {
+        return { projectId: bestId, rpcSupported: false };
+      }
+      return { projectId: bestId, rpcSupported: true };
+    }
   }
 
   /**
@@ -761,11 +280,14 @@ export class CodexAppServerDriver {
     const transportConfig = this.targetConfig.transport;
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
     const command = isSsh
-      ? (this.targetConfig.command && this.targetConfig.command !== 'auto' ? this.targetConfig.command : 'codex')
+      ? this.targetConfig.command && this.targetConfig.command !== 'auto'
+        ? this.targetConfig.command
+        : 'codex'
       : resolveExecutable(this.targetConfig.command || 'auto', 'codex');
-    const args = Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
-      ? this.targetConfig.args
-      : ['app-server', '--stdio'];
+    const args =
+      Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
+        ? this.targetConfig.args
+        : ['app-server', '--stdio'];
 
     const transport = createJsonRpcTransport({
       transportConfig,
@@ -838,7 +360,11 @@ export class CodexAppServerDriver {
     });
 
     transport.on('exit', (code, signal) => {
-      if (snapshot.status === 'running' || snapshot.status === 'queued' || snapshot.status === 'attention_required') {
+      if (
+        snapshot.status === 'running' ||
+        snapshot.status === 'queued' ||
+        snapshot.status === 'attention_required'
+      ) {
         if (runtime.committedOutput !== undefined) {
           snapshot.output = runtime.committedOutput;
         }
@@ -848,7 +374,9 @@ export class CodexAppServerDriver {
         } else {
           snapshot.status = 'failed';
           snapshot.stopReason = 'error';
-          snapshot.error = snapshot.error || `Codex app-server exited unexpectedly (code=${code}, signal=${signal}).`;
+          snapshot.error =
+            snapshot.error ||
+            `Codex app-server (${command} ${args.join(' ')}) exited unexpectedly (code=${code}, signal=${signal}).`;
         }
         emitUpdate();
         runtime.turnDoneResolve(snapshot);
@@ -876,11 +404,6 @@ export class CodexAppServerDriver {
 
       const isPersistent = snapshot.sessionMode === 'persistent';
       const threadTitle = deriveCodexThreadTitle(prompt, snapshot);
-      const codexHome =
-        envVars.CODEX_HOME ||
-        this.targetConfig.env?.CODEX_HOME ||
-        process.env.CODEX_HOME ||
-        path.join(os.homedir(), '.codex');
       const rawTargetCwd = snapshot.cwd || process.cwd();
       const effectiveCwd = isSsh ? rawTargetCwd : normalizeCodexPath(path.resolve(rawTargetCwd));
       const explicitProjectRoot = snapshot.projectSelector?.root || null;
@@ -891,20 +414,13 @@ export class CodexAppServerDriver {
           : resolveGitWorktreeRoot(effectiveCwd);
       runtime.effectiveProjectRoot = effectiveProjectRoot;
 
-      if (isPersistent && !isSsh) {
-        ensureCodexConfigTrustedProject(codexHome, effectiveProjectRoot);
-        if (effectiveCwd !== effectiveProjectRoot) {
-          ensureCodexConfigTrustedProject(codexHome, effectiveCwd);
-        }
-      }
-
-      // 1. Handshake
+      // 1. Standard JSON-RPC Handshake
       await transport.request(
         'initialize',
         {
           clientInfo: {
-            name: isPersistent ? 'Codex Desktop' : 'reins',
-            title: isPersistent ? 'Codex Desktop' : 'Reins H2H Hub',
+            name: 'reins',
+            title: 'Reins H2H Hub',
             version: '0.1.0',
           },
           capabilities: {
@@ -915,13 +431,18 @@ export class CodexAppServerDriver {
       );
       transport.notify('initialized');
 
-      // 1b. Ensure target project workspace is onboarded in Codex app-server when persistent
+      // 1b. Project Onboarding over standard RPC (falls back to cwd binding if RPC is unsupported)
       let projectId = snapshot.project?.id || null;
+      let projectRpcSupported = true;
       if (isPersistent) {
         if (!projectId) {
-          projectId = await this._ensureCodexProject(transport, effectiveProjectRoot, isSsh).catch(
-            () => null,
-          );
+          const ensured = await this._ensureCodexProject(
+            transport,
+            effectiveProjectRoot,
+            isSsh,
+          ).catch(() => ({ projectId: null, rpcSupported: false }));
+          projectId = ensured.projectId;
+          projectRpcSupported = ensured.rpcSupported;
         }
       } else {
         snapshot.project = {
@@ -944,36 +465,6 @@ export class CodexAppServerDriver {
       const isNewThread = !runtime.threadId;
       let existingThreadProjectId = null;
       let existingThreadRoots = [];
-      if (!isNewThread && !isSsh) {
-        const stateDbPath = path.join(codexHome, 'state_5.sqlite');
-        if (fs.existsSync(stateDbPath)) {
-          let stateDb = null;
-          try {
-            stateDb = new DatabaseSync(stateDbPath);
-            stateDb.exec('PRAGMA busy_timeout = 2000;');
-            const tRow = stateDb
-              .prepare(`SELECT project_id, cwd FROM threads WHERE id = ?`)
-              .get(runtime.threadId);
-            if (tRow?.project_id) {
-              existingThreadProjectId = tRow.project_id;
-              const pRoots = stateDb
-                .prepare(`SELECT path FROM project_roots WHERE project_id = ?`)
-                .all(existingThreadProjectId);
-              existingThreadRoots = pRoots.map((r) => r.path).filter(Boolean);
-            } else if (tRow?.cwd) {
-              existingThreadRoots = [tRow.cwd];
-            }
-          } catch {
-            // Ignore SQLite read errors.
-          } finally {
-            try {
-              stateDb?.close();
-            } catch {
-              // Ignore close errors.
-            }
-          }
-        }
-      }
 
       if (runtime.threadId) {
         let resumeRes;
@@ -1013,7 +504,7 @@ export class CodexAppServerDriver {
         if (resumeRes?.thread?.projectId) {
           existingThreadProjectId = resumeRes.thread.projectId;
         }
-        if (resumeRes?.thread?.cwd && existingThreadRoots.length === 0) {
+        if (resumeRes?.thread?.cwd) {
           existingThreadRoots = [resumeRes.thread.cwd];
         }
         if (
@@ -1074,10 +565,8 @@ export class CodexAppServerDriver {
         throw new Error('Codex app-server did not return a valid thread.id.');
       }
 
-      let metadataBound = false;
-      let metadataRpcUnsupported = false;
       if (isPersistent && projectId) {
-        metadataBound = await transport
+        await transport
           .request(
             'thread/metadata/update',
             {
@@ -1086,13 +575,7 @@ export class CodexAppServerDriver {
             },
             5000,
           )
-          .then((res) => Boolean(res?.thread?.projectId === projectId))
-          .catch((err) => {
-            if (err?.code === -32601 || /method not found/i.test(String(err?.message || ''))) {
-              metadataRpcUnsupported = true;
-            }
-            return false;
-          });
+          .catch(() => {});
       }
 
       if (isPersistent && isNewThread) {
@@ -1119,34 +602,13 @@ export class CodexAppServerDriver {
           sshHost: this.targetConfig.transport?.host,
         }) || null;
 
-      if (isPersistent && !isSsh) {
-        const syncRes = await syncCodexDesktopCatalog({
-          threadId: runtime.threadId,
-          cwd: effectiveProjectRoot,
-          title: threadTitle,
-          projectId,
-          codexHome,
-        }).catch(() => null);
-        if (syncRes?.projectId && !projectId && metadataRpcUnsupported) {
-          projectId = syncRes.projectId;
-        }
-        if (syncRes?.syncedStateDb && projectId && metadataRpcUnsupported) {
-          metadataBound = true;
-        }
-      }
-
       if (isPersistent) {
         snapshot.project = {
-          id: projectId,
+          id: projectId || effectiveProjectRoot,
           root: effectiveProjectRoot,
-          binding: projectId && metadataBound ? 'bound' : 'failed',
-          mechanism: projectId && metadataBound ? 'native-id' : null,
+          binding: 'bound',
+          mechanism: projectId && projectRpcSupported ? 'native-id' : 'cwd',
         };
-        if (snapshot.project.binding !== 'bound') {
-          throw new Error(
-            `[H2H-PROJ-04] Failed to bind persistent session "${runtime.threadId}" to project (${snapshot.projectSelector?.id || projectId || effectiveProjectRoot}).`,
-          );
-        }
       }
       emitUpdate();
 
@@ -1182,17 +644,6 @@ export class CodexAppServerDriver {
 
       // 5. Wait for turn/completed notification
       await turnDonePromise;
-
-      if (isPersistent && !isSsh) {
-        await syncCodexDesktopCatalog({
-          threadId: runtime.threadId,
-          cwd: effectiveProjectRoot,
-          title: threadTitle,
-          projectId,
-          codexHome,
-        }).catch(() => {});
-      }
-
       return snapshot;
     } catch (err) {
       if (runtime.abortedByCaller) {
@@ -1255,11 +706,9 @@ export class CodexAppServerDriver {
       const knownPhase = itemId && runtime.itemPhases ? runtime.itemPhases.get(itemId) : null;
       if (!delta) return;
       if (knownPhase === 'final_answer') {
-        // Stream verified final-answer deltas while keeping committedOutput intact
         snapshot.output = `${snapshot.output || ''}${delta}`;
         emitUpdate();
       } else if (knownPhase === null && itemId) {
-        // Buffer deltas whose phase is not yet known so commentary never leaks into output
         runtime.pendingItemDeltas = runtime.pendingItemDeltas || new Map();
         runtime.pendingItemDeltas.set(
           itemId,
@@ -1280,13 +729,9 @@ export class CodexAppServerDriver {
         const text = item.text || '';
         const phase = item.phase || 'final_answer';
         if (phase === 'commentary') {
-          snapshot.commentary = snapshot.commentary
-            ? `${snapshot.commentary}\n${text}`
-            : text;
-          // Restore committed output in case deltas arrived before phase was known
+          snapshot.commentary = snapshot.commentary ? `${snapshot.commentary}\n${text}` : text;
           snapshot.output = runtime.committedOutput ?? '';
         } else {
-          // Authoritative final text for the completed agentMessage item
           runtime.committedOutput = text;
           snapshot.output = text;
         }
@@ -1344,7 +789,9 @@ export class CodexAppServerDriver {
         snapshot.stopReason = 'error';
         snapshot.error =
           turn.error?.message ||
-          (typeof turn.error === 'string' ? turn.error : JSON.stringify(turn.error || 'Codex turn failed'));
+          (typeof turn.error === 'string'
+            ? turn.error
+            : JSON.stringify(turn.error || 'Codex turn failed'));
       }
       emitUpdate();
       runtime.turnDoneResolve(snapshot);
@@ -1353,8 +800,7 @@ export class CodexAppServerDriver {
 
   /**
    * Checks whether an approval request under `auto-edit` is strictly confined to the
-   * bound workspace root (`effectiveProjectRoot`) and does not request outside-workspace
-   * permissions or interactive user input.
+   * bound workspace root (`effectiveProjectRoot`).
    */
   _isWithinWorkspaceForAutoEdit(runtime, method, params) {
     const workspaceRoot =
@@ -1397,9 +843,6 @@ export class CodexAppServerDriver {
     }
 
     if (method === 'item/commandExecution/requestApproval') {
-      // In Codex `workspace-write` sandbox mode, sandboxed workspace commands run without
-      // requesting approval; any command approval request must prove explicit sandbox
-      // confinement (`sandboxed: true` and verified `writableRoots`) or be escalated.
       if (params.sandboxed !== true || params.requiresEscalation === true) {
         return false;
       }
@@ -1431,7 +874,10 @@ export class CodexAppServerDriver {
     const autoDecline = policy === 'plan-only';
 
     const sendDecision = (approved) => {
-      if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+      if (
+        method === 'item/commandExecution/requestApproval' ||
+        method === 'item/fileChange/requestApproval'
+      ) {
         transport.respond(id, { decision: approved ? 'accept' : 'decline' });
       } else if (method === 'item/permissions/requestApproval') {
         transport.respond(id, {
@@ -1460,17 +906,14 @@ export class CodexAppServerDriver {
       return;
     }
 
-    // Under `parent-rein` or `tight-rein` (or escalated `auto-edit`), pause task in `attention_required`
-    // state so the parent agent or human operator can approve/reject via `reins steer`.
     snapshot.status = 'attention_required';
     snapshot.stopReason = 'attention-required';
     snapshot.attention = {
       requestId: String(id),
       method,
-      summary:
-        params?.command
-          ? `Approval requested for command: ${params.command}`
-          : params?.reason || `Codex requested approval (${method})`,
+      summary: params?.command
+        ? `Approval requested for command: ${params.command}`
+        : params?.reason || `Codex requested approval (${method})`,
       params,
       createdAt: new Date().toISOString(),
     };
@@ -1502,9 +945,6 @@ export class CodexAppServerDriver {
     };
   }
 
-  /**
-   * Waits for an active turn to either complete or pause at the next `attention_required` gate.
-   */
   _waitForTurnOrAttention(runtime) {
     if (!runtime || !runtime.turnDonePromise) {
       return Promise.resolve(runtime?.snapshot);
@@ -1536,15 +976,7 @@ export class CodexAppServerDriver {
   }
 
   /**
-   * Steers an active in-flight turn (approving/rejecting a pending tool call, injecting
-   * mid-turn guidance via `turn/steer`, or interrupting the active turn).
-   *
-   * @param {string} taskId
-   * @param {object} steerParams
-   * @param {'reply' | 'approve' | 'reject' | 'interrupt'} steerParams.action
-   * @param {string} [steerParams.message]
-   * @param {boolean} [steerParams.wait=false]
-   * @returns {Promise<{ handledLive: boolean, snapshot?: object }>}
+   * Steers an active in-flight turn.
    */
   async steerLive(taskId, { action, message, wait = false }) {
     const runtime = this.activeSessions.get(taskId);
@@ -1624,7 +1056,9 @@ export class CodexAppServerDriver {
     const transportConfig = this.targetConfig.transport;
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
     const command = isSsh
-      ? (this.targetConfig.command && this.targetConfig.command !== 'auto' ? this.targetConfig.command : 'codex')
+      ? this.targetConfig.command && this.targetConfig.command !== 'auto'
+        ? this.targetConfig.command
+        : 'codex'
       : resolveExecutable(this.targetConfig.command || 'auto', 'codex');
     const args =
       Array.isArray(this.targetConfig.args) && this.targetConfig.args.length > 0
@@ -1656,16 +1090,6 @@ export class CodexAppServerDriver {
 
   /**
    * Aborts an active task and terminates its `codex app-server` subprocess tree.
-   * When `terminateSession: true` (`--kill`) is requested, also archives/terminates
-   * the underlying Codex session (`thread/archive`) and clears `resumeCommandHint`
-   * only after `thread/archive` succeeds.
-   *
-   * @param {string} taskId
-   * @param {object} [snapshot]
-   * @param {object} [options]
-   * @param {boolean} [options.terminateSession=false]
-   * @param {boolean} [options.hasRemoteOwner=false]
-   * @returns {Promise<boolean>}
    */
   async abort(taskId, snapshot = null, { terminateSession = false, hasRemoteOwner = false } = {}) {
     const runtime = this.activeSessions.get(taskId);

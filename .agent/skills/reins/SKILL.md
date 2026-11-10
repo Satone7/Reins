@@ -229,3 +229,22 @@ After writing or editing `~/.reins/config.yaml`, always run:
 reins targets --json
 ```
 to confirm `"initialized": true` and verify that all registered targets and their `rules` parse cleanly.
+
+---
+
+## 6. Southbound Harness Invocation Contracts & Cross-Version Self-Healing
+
+Reins' Southbound Drivers (`src/drivers/*.js`) are intentionally **thin, version-agnostic protocol & stream primitives**. They do **not** mutate private SQLite databases, scrape internal credential files, or poll undocumented internal log directories:
+
+| Harness (`harnessType`) | Driver Mode (`driver.mode`) | Standard Invocation Primitive |
+| :--- | :--- | :--- |
+| **`codex`** | `codex-app-server` | Standard JSON-RPC 2.0 over `<command> app-server --stdio` (`initialize` $\rightarrow$ `thread/start` / `thread/resume` $\rightarrow$ `turn/start`). Gracefully falls back to `cwd` project binding if the installed `codex` version does not implement `project/list`. |
+| **`claude-code`** | `claude-print` / `claude-tmux` | Standard JSONL stream over `<command> -p <prompt> --output-format stream-json --verbose [--resume <id>]`. When `claude-tmux` is selected for persistent sessions, attaches/resumes a detached `tmux` session (`tmux new-session -d -s <name> "<claude> --resume <id>"`). |
+| **`dsh`** | `acp` / `dsh-headless` | Standard ACP JSON-RPC 2.0 over `<command> --profile acp` (`initialize` $\rightarrow$ `session/new` / `session/load` $\rightarrow$ `session/prompt`) or JSONL stream over `<command> --profile headless --json`. |
+| **`antigravity`** | `agy-cli` / `antigravity-sdk` | Standard CLI invocation over `<command> --prompt <prompt> [--ephemeral | --conversation <id>]`. |
+
+### Self-Healing When a User Has a Different Harness Version Installed
+Because different users install different versions of `codex`, `claude`, `dsh`, or `agy` (or use custom wrappers/install paths), a target CLI may reject a flag or require custom arguments/environment variables:
+1. **Inspect `snapshot.error` and `snapshot.diagnostic`**: Whenever a CLI or JSON-RPC process fails, Reins' `runStreamingProcess` / `JsonRpcStdioTransport` returns the exact `commandLine`, `exitCode`, and `stderr` in `snapshot.error`.
+2. **Probe the Target Version & Help**: Run `<command> --version` or `<command> --help` (locally or via `ssh <host>`) to check the exact CLI flags supported by the user's installed version.
+3. **Adapt `~/.reins/config.yaml` and Retry**: Update `driver.command`, `driver.args`, or `env` for that target in `~/.reins/config.yaml` to match the user's installed version, verify with `reins targets --json`, and re-run the delegation. Once saved in `~/.reins/config.yaml`, the adapted configuration persists for all future sessions.

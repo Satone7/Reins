@@ -1,35 +1,27 @@
 /**
- * DeepSeek Harness driver over ACP JSON-RPC stdio or SSH.
+ * DeepSeek Harness driver over ACP JSON-RPC stdio or headless JSONL stream.
+ *
+ * Thin, version-agnostic protocol driver that delegates via `createJsonRpcTransport`
+ * (for ACP mode) or `runStreamingProcess` (for headless CLI mode) without scraping
+ * private `~/.dsh/.credentials.yaml` files via custom `awk` scripts.
  */
 
-import { spawn } from 'node:child_process';
-import readline from 'node:readline';
 import {
   applyPresetPrompt,
   buildResumeCommandHint,
   formatDiagnosticSummary,
 } from '../protocol/schema.js';
 import { killProcessTree, resolveExecutable } from '../transports/local.js';
-import { buildPosixCommandLine, buildSshArgs, createJsonRpcTransport } from '../transports/ssh.js';
-
-const CREDENTIAL_LOADER = [
-  'if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -f "$HOME/.dsh/.credentials.yaml" ]; then',
-  '  DEEPSEEK_API_KEY=$(awk \'' +
-    '/^[[:space:]]*refs:[[:space:]]*$/ { in_refs=1; next } ' +
-    'in_refs && /^[^[:space:]]/ { exit } ' +
-    'in_refs && /^[[:space:]]*DEEPSEEK_API_KEY:[[:space:]]*/ ' +
-    '{ sub(/^[[:space:]]*DEEPSEEK_API_KEY:[[:space:]]*/, ""); print; exit }' +
-    '\' "$HOME/.dsh/.credentials.yaml")',
-  '  if [ -n "$DEEPSEEK_API_KEY" ]; then export DEEPSEEK_API_KEY; fi',
-  'fi',
-  'exec "$@"',
-].join('\n');
+import { createJsonRpcTransport, runStreamingProcess } from '../transports/ssh.js';
 
 function findAllowOption(options) {
-  return options?.find((option) =>
-    option.optionId !== undefined &&
-    [option.kind, option.name, option.title, option.label].some((value) =>
-      /^(allow|approve)(?:\b|_)/i.test(value || '')));
+  return options?.find(
+    (option) =>
+      option.optionId !== undefined &&
+      [option.kind, option.name, option.title, option.label].some((value) =>
+        /^(allow|approve)(?:\b|_)/i.test(value || ''),
+      ),
+  );
 }
 
 function isUnsupportedMethod(error) {
@@ -95,7 +87,9 @@ export class DshDriver {
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
     const configuredCommand = this.targetConfig.command || 'auto';
     const command = isSsh
-      ? (configuredCommand === 'auto' ? 'dsh' : configuredCommand)
+      ? configuredCommand === 'auto'
+        ? 'dsh'
+        : configuredCommand
       : resolveExecutable(configuredCommand, 'dsh');
     const effectiveModel = snapshot.model || this.targetConfig.model;
     const env = { ...(this.targetConfig.env || {}), ...envVars };
@@ -138,8 +132,12 @@ export class DshDriver {
     };
 
     transport.on('notification', (method, params) => {
-      if (method !== 'session/update' ||
-          (params?.sessionId && params.sessionId !== snapshot.sessionId)) return;
+      if (
+        method !== 'session/update' ||
+        (params?.sessionId && params.sessionId !== snapshot.sessionId)
+      ) {
+        return;
+      }
       const update = params.update || {};
       const content = update.content;
       const text = content?.type === 'text' ? content.text || '' : '';
@@ -206,35 +204,57 @@ export class DshDriver {
 
     try {
       transport.start();
-      await transport.request('initialize', {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: true, writeTextFile: true },
-          terminal: true,
+      await transport.request(
+        'initialize',
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: true, writeTextFile: true },
+            terminal: true,
+          },
+          clientInfo: { name: 'reins', version: '0.1.0' },
         },
-        clientInfo: { name: 'reins', version: '0.1.0' },
-      }, 20000);
+        20000,
+      );
 
       const sessionParams = { cwd: snapshot.cwd, mcpServers: [] };
       if (snapshot.sessionId) {
         try {
-          await transport.request('session/load', {
-            sessionId: snapshot.sessionId,
-            ...sessionParams,
-          }, 30000);
+          await transport.request(
+            'session/load',
+            {
+              sessionId: snapshot.sessionId,
+              ...sessionParams,
+            },
+            30000,
+          );
         } catch (error) {
           if (!isUnsupportedMethod(error)) throw error;
-          const created = await transport.request('session/new', {
-            ...sessionParams,
-            _meta: { ephemeral: snapshot.sessionMode === 'ephemeral', reinPolicy: snapshot.reinPolicy },
-          }, 30000);
+          const created = await transport.request(
+            'session/new',
+            {
+              ...sessionParams,
+              _meta: {
+                ephemeral: snapshot.sessionMode === 'ephemeral',
+                reinPolicy: snapshot.reinPolicy,
+              },
+            },
+            30000,
+          );
           snapshot.sessionId = created?.sessionId;
         }
       } else {
-        const created = await transport.request('session/new', {
-          ...sessionParams,
-          _meta: { ephemeral: snapshot.sessionMode === 'ephemeral', reinPolicy: snapshot.reinPolicy },
-        }, 30000);
+        const created = await transport.request(
+          'session/new',
+          {
+            ...sessionParams,
+            _meta: {
+              ephemeral: snapshot.sessionMode === 'ephemeral',
+              reinPolicy: snapshot.reinPolicy,
+            },
+          },
+          30000,
+        );
         snapshot.sessionId = created?.sessionId;
       }
       if (!snapshot.sessionId) throw new Error('ACP session/new did not return a sessionId.');
@@ -248,10 +268,14 @@ export class DshDriver {
       emitUpdate();
 
       snapshot.metrics.turnCount = (snapshot.metrics.turnCount || 0) + 1;
-      runtime.promptPromise = transport.request('session/prompt', {
-        sessionId: snapshot.sessionId,
-        prompt: [{ type: 'text', text: applyPresetPrompt(prompt, snapshot.preset) }],
-      }, timeoutMs);
+      runtime.promptPromise = transport.request(
+        'session/prompt',
+        {
+          sessionId: snapshot.sessionId,
+          prompt: [{ type: 'text', text: applyPresetPrompt(prompt, snapshot.preset) }],
+        },
+        timeoutMs,
+      );
       const result = await runtime.promptPromise;
       if (runtime.aborted || result?.stopReason === 'cancelled') {
         snapshot.status = 'aborted';
@@ -291,29 +315,21 @@ export class DshDriver {
     const transportConfig = this.targetConfig.transport;
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';
     const configuredCommand = this.targetConfig.command || 'auto';
-    const command = isSsh
-      ? (configuredCommand === 'auto' ? 'dsh' : configuredCommand)
-      : resolveExecutable(configuredCommand, 'dsh');
+    const command = isSsh && configuredCommand === 'auto' ? 'dsh' : configuredCommand;
     const framedPrompt = applyPresetPrompt(prompt, snapshot.preset);
     const args = [...(Array.isArray(this.targetConfig.args) ? this.targetConfig.args : [])];
     if (!args.includes('--profile')) args.push('--profile', 'headless');
     if (!args.includes('--json')) args.push('--json');
     if (snapshot.sessionId) args.push('--session-id', snapshot.sessionId);
     args.push(framedPrompt);
+
     const env = { ...(this.targetConfig.env || {}), ...envVars };
     const effectiveModel = snapshot.model || this.targetConfig.model;
     if (effectiveModel) env.DEEPSEEK_MODEL ||= effectiveModel;
     if (process.env.DEEPSEEK_API_KEY) env.DEEPSEEK_API_KEY ||= process.env.DEEPSEEK_API_KEY;
     if (process.env.DEEPSEEK_BASE_URL) env.DEEPSEEK_BASE_URL ||= process.env.DEEPSEEK_BASE_URL;
     if (isSsh) env.NARB_DISABLE_NATIVE_CACHE ||= '1';
-    const remoteCommand = this.targetConfig.loadCredentialsFromDsh === false
-      ? buildPosixCommandLine(command, args, snapshot.cwd, env, { closeStdin: true })
-      : buildPosixCommandLine(
-        'sh', ['-c', CREDENTIAL_LOADER, 'reins-dsh', command, ...args],
-        snapshot.cwd, env, { closeStdin: true },
-      );
-    const spawnCommand = isSsh ? 'ssh' : command;
-    const spawnArgs = isSsh ? ['-n', ...buildSshArgs(transportConfig, remoteCommand)] : args;
+
     const appendEvent = (event) => {
       snapshot.transcript.lastSeq += 1;
       snapshot.transcript.totalEvents += 1;
@@ -340,26 +356,17 @@ export class DshDriver {
     emitUpdate();
 
     try {
-      const result = await new Promise((resolve) => {
-        let child;
-        try {
-          child = spawn(spawnCommand, spawnArgs, {
-            cwd: isSsh ? process.cwd() : snapshot.cwd || process.cwd(),
-            env: isSsh ? process.env : { ...process.env, ...env },
-            stdio: ['ignore', 'pipe', 'pipe'],
-            windowsHide: true,
-            detached: process.platform !== 'win32',
-            shell: !isSsh && process.platform === 'win32' && /\.(cmd|bat)$/i.test(command),
-          });
-        } catch (error) {
-          resolve({ error });
-          return;
-        }
-        runtime.child = child;
-        let stderr = '';
-        let error = null;
-        const reader = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-        reader.on('line', (line) => {
+      const result = await runStreamingProcess({
+        command,
+        args,
+        harnessKind: 'dsh',
+        cwd: snapshot.cwd,
+        env,
+        transportConfig,
+        timeoutMs,
+        closeRemoteStdin: true,
+        runtime,
+        onLine: (line) => {
           let event;
           try {
             event = JSON.parse(line);
@@ -369,8 +376,11 @@ export class DshDriver {
           if (event.type === 'session' && event.sessionId) {
             snapshot.sessionId = event.sessionId;
             snapshot.resumeCommandHint = buildResumeCommandHint({
-              kind: 'dsh', sessionId: snapshot.sessionId, sessionMode: snapshot.sessionMode,
-              transportType: isSsh ? 'ssh' : 'local', sshHost: transportConfig?.host || transportConfig?.sshHost,
+              kind: 'dsh',
+              sessionId: snapshot.sessionId,
+              sessionMode: snapshot.sessionMode,
+              transportType: isSsh ? 'ssh' : 'local',
+              sshHost: transportConfig?.host || transportConfig?.sshHost,
             });
           } else if (event.type === 'thinking' && typeof event.text === 'string') {
             snapshot.commentary = `${snapshot.commentary || ''}${event.text}`;
@@ -378,44 +388,42 @@ export class DshDriver {
             snapshot.output = `${snapshot.output || ''}${event.text}`;
           } else if (event.type === 'final' && typeof event.text === 'string') {
             snapshot.output = event.text;
-            runtime.sawFinal = true;
           } else if (event.type === 'status' && event.phase === 'step_end' && event.usage) {
             const usage = event.usage;
             const previous = snapshot.metrics.tokens || {};
             snapshot.metrics.tokens = {
-              inputTokens: (previous.inputTokens || 0) + (usage.inputTokens ?? usage.input_tokens ?? 0),
-              outputTokens: (previous.outputTokens || 0) + (usage.outputTokens ?? usage.output_tokens ?? 0),
-              cacheReadTokens: (previous.cacheReadTokens || 0) + (usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0),
+              inputTokens:
+                (previous.inputTokens || 0) + (usage.inputTokens ?? usage.input_tokens ?? 0),
+              outputTokens:
+                (previous.outputTokens || 0) + (usage.outputTokens ?? usage.output_tokens ?? 0),
+              cacheReadTokens:
+                (previous.cacheReadTokens || 0) +
+                (usage.cacheReadTokens ?? usage.cache_read_tokens ?? 0),
             };
           } else if (event.type === 'status' && event.phase === 'turn_end') {
             runtime.turnReason = event.reason;
           }
           emitUpdate();
-        });
-        child.stderr.setEncoding('utf8');
-        child.stderr.on('data', (chunk) => { stderr += chunk; });
-        child.on('error', (caught) => { error = caught; });
-        child.on('close', (exitCode) => {
-          resolve({ exitCode, stderr, error });
-        });
-        if (timeoutMs > 0) {
-          runtime.timer = setTimeout(() => {
-            runtime.timedOut = true;
-            killProcessTree(child).catch(() => {});
-          }, timeoutMs);
-        }
+        },
       });
+
       if (runtime.aborted) {
         snapshot.status = 'aborted';
         snapshot.stopReason = 'aborted';
-      } else if (runtime.timedOut || result.error || result.exitCode !== 0 ||
-          runtime.turnReason?.kind === 'error') {
+      } else if (
+        result.timedOut ||
+        result.error ||
+        result.exitCode !== 0 ||
+        runtime.turnReason?.kind === 'error'
+      ) {
         snapshot.status = 'failed';
         snapshot.stopReason = 'error';
-        snapshot.error = runtime.timedOut
+        snapshot.error = result.timedOut
           ? `DeepSeek Harness turn timed out after ${timeoutMs}ms.`
-          : result.error?.message || runtime.turnReason?.message || result.stderr?.trim() ||
-            `DeepSeek Harness exited with code ${result.exitCode}.`;
+          : result.error?.message ||
+            runtime.turnReason?.message ||
+            result.stderr?.trim() ||
+            `DeepSeek Harness (${result.commandLine}) exited with code ${result.exitCode}.`;
       } else {
         appendEvent({ role: 'assistant', phase: 'final_answer', text: snapshot.output });
         snapshot.status = 'completed';
@@ -424,7 +432,6 @@ export class DshDriver {
       emitUpdate();
       return snapshot;
     } finally {
-      if (runtime.timer) clearTimeout(runtime.timer);
       this.activeSessions.delete(snapshot.taskId);
     }
   }
@@ -437,7 +444,9 @@ export class DshDriver {
         await this.abort(taskId);
         return { handledLive: true };
       }
-      if (action === 'reply') throw new Error('An active DSH headless turn cannot accept a live reply.');
+      if (action === 'reply') {
+        throw new Error('An active DSH headless turn cannot accept a live reply.');
+      }
       return { handledLive: false };
     }
     if (action === 'approve' || action === 'reject') {
@@ -484,7 +493,9 @@ export class DshDriver {
           let graceTimer;
           await Promise.race([
             runtime.promptPromise.catch(() => {}),
-            new Promise((resolve) => { graceTimer = setTimeout(resolve, 250); }),
+            new Promise((resolve) => {
+              graceTimer = setTimeout(resolve, 250);
+            }),
           ]);
           clearTimeout(graceTimer);
         }

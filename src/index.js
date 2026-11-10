@@ -30,8 +30,7 @@ export {
   CodexAppServerDriver,
   deriveCodexThreadTitle,
   normalizeCodexPath,
-  notifyCodexDesktopIpc,
-  syncCodexDesktopCatalog,
+  resolveGitWorktreeRoot,
 } from './drivers/codex-app-server.js';
 export { AntigravityDriver } from './drivers/antigravity-driver.js';
 export { DshDriver } from './drivers/dsh-driver.js';
@@ -43,6 +42,7 @@ export {
   execRemoteCommand,
   SshStdioTransport,
   createJsonRpcTransport,
+  runStreamingProcess,
 } from './transports/ssh.js';
 
 const __filename = fileURLToPath(import.meta.url);
