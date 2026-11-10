@@ -437,12 +437,16 @@ export function normalizeTargetConfig(id, raw = {}) {
     undefined;
   const model =
     raw.model ||
+    raw.defaultModel ||
     driverObj?.model ||
+    driverObj?.defaultModel ||
     undefined;
   const effort =
     raw.effort ||
+    raw.defaultEffort ||
     raw.reasoningEffort ||
     driverObj?.effort ||
+    driverObj?.defaultEffort ||
     driverObj?.reasoningEffort ||
     undefined;
   const rules = normalizeTargetRules(raw);
@@ -468,28 +472,38 @@ export function normalizeTargetConfig(id, raw = {}) {
 }
 
 /**
- * Converts either a map or an array of target entries into a normalized target map.
+ * Converts either a map or an array of target entries into a normalized target map,
+ * optionally merging global caller rules (`hub.rules` or top-level `rules`) into each target.
  *
  * @param {object | Array<object>} rawTargets
+ * @param {string} [globalRules]
  * @returns {Record<string, object>}
  */
-export function normalizeTargetsMap(rawTargets) {
+export function normalizeTargetsMap(rawTargets, globalRules) {
   const result = {};
 
+  function applyGlobalRules(target) {
+    if (!globalRules) return target;
+    const combinedRules = target.rules
+      ? `${globalRules}\n${target.rules}`
+      : globalRules;
+    return { ...target, rules: combinedRules };
+  }
+
   for (const [id, def] of Object.entries(DEFAULT_CONFIG.targets)) {
-    result[id] = normalizeTargetConfig(id, def);
+    result[id] = applyGlobalRules(normalizeTargetConfig(id, def));
   }
 
   if (Array.isArray(rawTargets)) {
     for (const item of rawTargets) {
       if (item && typeof item === 'object' && item.id) {
-        result[item.id] = normalizeTargetConfig(item.id, item);
+        result[item.id] = applyGlobalRules(normalizeTargetConfig(item.id, item));
       }
     }
   } else if (rawTargets && typeof rawTargets === 'object') {
     for (const [id, item] of Object.entries(rawTargets)) {
       if (item && typeof item === 'object') {
-        result[id] = normalizeTargetConfig(id, item);
+        result[id] = applyGlobalRules(normalizeTargetConfig(id, item));
       }
     }
   }
@@ -526,6 +540,7 @@ export function loadConfig(configPath, options = {}) {
       const raw = fs.readFileSync(resolved, 'utf8');
       const parsed = resolved.endsWith('.json') ? JSON.parse(raw) : parseSimpleYaml(raw);
       const rawHub = parsed.hub || {};
+      const globalRules = normalizeTargetRules(parsed) || normalizeTargetRules(rawHub);
       return {
         config: {
           version: parsed.version || DEFAULT_CONFIG.version,
@@ -533,8 +548,9 @@ export function loadConfig(configPath, options = {}) {
             ...DEFAULT_CONFIG.hub,
             ...rawHub,
             maxHops: rawHub.maxHops ?? rawHub.loopGuard?.maxHops ?? DEFAULT_CONFIG.hub.maxHops,
+            ...(globalRules ? { rules: globalRules } : {}),
           },
-          targets: normalizeTargetsMap(parsed.targets),
+          targets: normalizeTargetsMap(parsed.targets, globalRules),
         },
         configSource: resolved,
       };
@@ -564,9 +580,11 @@ export class TargetRegistry {
   constructor({ configPath, configOverride, ignoreUserConfig } = {}) {
     loadEnvFile();
     if (configOverride) {
+      const globalRules =
+        normalizeTargetRules(configOverride) || normalizeTargetRules(configOverride.hub || {});
       this.config = {
         ...configOverride,
-        targets: normalizeTargetsMap(configOverride.targets),
+        targets: normalizeTargetsMap(configOverride.targets, globalRules),
       };
       this.configSource = 'override';
     } else {

@@ -773,6 +773,29 @@ targets:
     assert.ok(found, `Expected ${targetId} in config/reins.test.yaml`);
     assert.equal(found.model, 'deepseek-flash');
   }
+
+  // Global hub.rules merges with target-specific rules
+  const globalRuleRegistry = new TargetRegistry({
+    configOverride: {
+      hub: {
+        rules: 'Global Rule: Prefer flagship models and high reasoning effort.',
+      },
+      targets: {
+        'custom-node': {
+          kind: 'claude-code',
+          driver: 'claude-print',
+          defaultModel: 'opus',
+          defaultEffort: 'high',
+          rules: 'Target Rule: Use English.',
+        },
+      },
+    },
+  });
+  const customNode = globalRuleRegistry.listTargets().find((t) => t.id === 'custom-node');
+  assert.equal(customNode.model, 'opus');
+  assert.equal(customNode.effort, 'high');
+  assert.match(customNode.rules, /Global Rule: Prefer flagship models/);
+  assert.match(customNode.rules, /Target Rule: Use English/);
 });
 
 test('TaskManager & ReinsMcpServer: end-to-end lifecycle with mock driver', async () => {
