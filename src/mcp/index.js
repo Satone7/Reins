@@ -16,6 +16,10 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { TaskManager } from '../hub/task-manager.js';
 import {
+  discoverLocalHarnesses,
+  discoverSshHosts,
+} from '../cli/init.js';
+import {
   REASONING_EFFORTS,
   REIN_POLICIES,
   SESSION_MODES,
@@ -323,6 +327,8 @@ export class ReinsMcpServer {
     try {
       if (name === 'reins_targets') {
         const allTargets = this.taskManager.registry.listTargets();
+        const initialized = Boolean(this.taskManager.registry.initialized);
+        const userConfigPath = this.taskManager.registry.userConfigPath;
         const targets = args.targetId
           ? allTargets.filter((t) => t.id === args.targetId)
           : allTargets;
@@ -344,6 +350,18 @@ export class ReinsMcpServer {
               type: 'text',
               text: JSON.stringify(
                 {
+                  initialized,
+                  configSource: this.taskManager.registry.configSource,
+                  userConfigPath,
+                  ...(!initialized
+                    ? {
+                        needsInit: true,
+                        discovery: {
+                          localHarnesses: discoverLocalHarnesses({ cwd: process.cwd() }),
+                          sshHosts: discoverSshHosts(),
+                        },
+                      }
+                    : {}),
                   targets,
                   ...(modelCatalog ? { modelCatalog } : {}),
                 },

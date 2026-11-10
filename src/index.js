@@ -19,6 +19,14 @@ export { TaskManager } from './hub/task-manager.js';
 export { ReinsHubServer } from './hub/server.js';
 export { ReinsMcpServer, MCP_TOOLS } from './mcp/index.js';
 export {
+  discoverLocalHarnesses,
+  discoverSshHosts,
+  probeRemoteSshHost,
+  inspectExistingConfig,
+  syncLocalHarnessSkills,
+  buildAtomicDiscoverySnapshot,
+} from './cli/init.js';
+export {
   CodexAppServerDriver,
   deriveCodexThreadTitle,
   normalizeCodexPath,

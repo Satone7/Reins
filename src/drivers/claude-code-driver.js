@@ -182,7 +182,7 @@ export class ClaudeCodeDriver {
     return name;
   }
 
-  async runTurn(snapshot, { prompt, envVars = {}, timeoutMs = 600000 }, onUpdate = () => {}) {
+  async runTurn(snapshot, { prompt, envVars = {}, timeoutMs = 3600000 }, onUpdate = () => {}) {
     const startedAt = Date.now();
     const transportConfig = this._transportConfig();
     const isSsh = transportConfig?.type === 'ssh' || transportConfig?.kind === 'ssh';

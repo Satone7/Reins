@@ -14,6 +14,13 @@ import fs from 'node:fs';
 import { TargetRegistry } from '../hub/registry.js';
 import { TaskManager } from '../hub/task-manager.js';
 import { ReinsHubServer } from '../hub/server.js';
+import {
+  buildAtomicDiscoverySnapshot,
+  discoverLocalHarnesses,
+  discoverSshHosts,
+  probeRemoteSshHost,
+  syncLocalHarnessSkills,
+} from './init.js';
 
 const VERSION = '0.1.0';
 
@@ -24,7 +31,10 @@ Usage:
   reins <command> [options]
 
 Commands:
-  targets                           List all registered H2H Harness targets
+  targets                           List all registered H2H Harness targets (and discovery if uninitialized)
+  discover                          Output atomic local harness & SSH host discovery for Agent-guided init
+  probe-ssh <sshHost>               Probe a remote SSH host for $HOME and installed harness/tmux binaries
+  sync-skills [harnesses]           Sync SKILL.md to local harnesses (codex,antigravity,dsh,claude-code)
   models [targetId]                 List selectable models and reasoning efforts for a target (default: local-codex)
   delegate <targetId> [options]     Delegate a task or resume a session on a target Harness
   status [taskId] [options]         Query status/transcript of a task or list recent tasks
@@ -79,6 +89,8 @@ export function parseCliArgs(argv) {
       flags.help = true;
     } else if (arg === '-v' || arg === '--version') {
       flags.version = true;
+    } else if (arg === '--probe-ssh') {
+      flags.probeSsh = argv[++i];
     } else if (arg === '--persistent') {
       flags.sessionMode = 'persistent';
     } else if (arg === '--ephemeral') {
@@ -172,13 +184,45 @@ export async function runCli(argv) {
     return;
   }
 
-  const registry = flags.config ? new TargetRegistry({ configPath: flags.config }) : undefined;
-  const taskManager = new TaskManager({
-    registry,
-    stateDir: flags.stateDir,
-  });
-
   try {
+    if (command === 'probe-ssh') {
+      const sshHost = positionals[1] || flags.probeSsh;
+      if (!sshHost) {
+        throw new Error('Usage: reins probe-ssh <sshHost> [--json]');
+      }
+      const res = probeRemoteSshHost(sshHost);
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
+    if (command === 'sync-skills') {
+      const argList = positionals[1]
+        ? positionals[1].split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined;
+      const synced = syncLocalHarnessSkills(argList);
+      console.log(JSON.stringify({ synced }, null, 2));
+      return;
+    }
+
+    if (command === 'discover' || command === 'init') {
+      if (flags.probeSsh) {
+        console.log(JSON.stringify(probeRemoteSshHost(flags.probeSsh), null, 2));
+        return;
+      }
+      const snapshot = buildAtomicDiscoverySnapshot({
+        cwd: flags.cwd || process.cwd(),
+        configPath: flags.config || '~/.reins/config.yaml',
+      });
+      console.log(JSON.stringify(snapshot, null, 2));
+      return;
+    }
+
+    const registry = flags.config ? new TargetRegistry({ configPath: flags.config }) : undefined;
+    const taskManager = new TaskManager({
+      registry,
+      stateDir: flags.stateDir,
+    });
+
     if (command === '_worker') {
       const taskId = positionals[1];
       await taskManager.runDetachedWorkerTask(taskId);
@@ -187,9 +231,32 @@ export async function runCli(argv) {
 
     if (command === 'targets') {
       const targets = taskManager.registry.listTargets();
+      const initialized = Boolean(taskManager.registry.initialized);
+      const userConfigPath = taskManager.registry.userConfigPath;
+
       if (flags.json) {
-        console.log(JSON.stringify({ targets }, null, 2));
+        const payload = {
+          initialized,
+          configSource: taskManager.registry.configSource,
+          userConfigPath,
+          ...(!initialized
+            ? {
+                needsInit: true,
+                discovery: {
+                  localHarnesses: discoverLocalHarnesses({ cwd: process.cwd() }),
+                  sshHosts: discoverSshHosts(),
+                },
+              }
+            : {}),
+          targets,
+        };
+        console.log(JSON.stringify(payload, null, 2));
       } else {
+        if (!initialized) {
+          console.log(
+            `[UNINITIALIZED] User configuration not found at ${userConfigPath}.`,
+          );
+        }
         console.log(`Registered H2H Targets (${targets.length}):\n`);
         for (const t of targets) {
           const availTag = t.available ? 'READY' : 'UNVERIFIED';

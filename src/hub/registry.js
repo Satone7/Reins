@@ -490,19 +490,33 @@ export function normalizeTargetsMap(rawTargets, globalRules) {
     return { ...target, rules: combinedRules };
   }
 
-  for (const [id, def] of Object.entries(DEFAULT_CONFIG.targets)) {
-    result[id] = applyGlobalRules(normalizeTargetConfig(id, def));
+  if (rawTargets === undefined || rawTargets === null) {
+    for (const [id, def] of Object.entries(DEFAULT_CONFIG.targets)) {
+      result[id] = applyGlobalRules(normalizeTargetConfig(id, def));
+    }
+    return result;
   }
 
   if (Array.isArray(rawTargets)) {
     for (const item of rawTargets) {
-      if (item && typeof item === 'object' && item.id) {
+      if (
+        item &&
+        typeof item === 'object' &&
+        item.id &&
+        item.enabled !== false &&
+        item.disabled !== true
+      ) {
         result[item.id] = applyGlobalRules(normalizeTargetConfig(item.id, item));
       }
     }
   } else if (rawTargets && typeof rawTargets === 'object') {
     for (const [id, item] of Object.entries(rawTargets)) {
-      if (item && typeof item === 'object') {
+      if (
+        item &&
+        typeof item === 'object' &&
+        item.enabled !== false &&
+        item.disabled !== true
+      ) {
         result[id] = applyGlobalRules(normalizeTargetConfig(id, item));
       }
     }
@@ -523,6 +537,8 @@ export function loadConfig(configPath, options = {}) {
   loadEnvFile();
   const skipUserConfig =
     options.ignoreUserConfig === true || process.env.REINS_IGNORE_USER_CONFIG === '1';
+  const exampleConfigPath = path.join(REPO_ROOT, 'config', 'reins.example.yaml');
+  const defaultUserConfigPath = expandHome(configPath || process.env.REINS_CONFIG || '~/.reins/config.yaml');
 
   const candidates = [
     configPath,
@@ -531,7 +547,7 @@ export function loadConfig(configPath, options = {}) {
     !skipUserConfig ? path.resolve(process.cwd(), 'config', 'reins.json') : null,
     !skipUserConfig ? expandHome('~/.reins/config.yaml') : null,
     !skipUserConfig ? expandHome('~/.reins/config.json') : null,
-    path.join(REPO_ROOT, 'config', 'reins.example.yaml'),
+    exampleConfigPath,
   ].filter(Boolean);
 
   for (const candidate of candidates) {
@@ -541,6 +557,15 @@ export function loadConfig(configPath, options = {}) {
       const parsed = resolved.endsWith('.json') ? JSON.parse(raw) : parseSimpleYaml(raw);
       const rawHub = parsed.hub || {};
       const globalRules = normalizeTargetRules(parsed) || normalizeTargetRules(rawHub);
+      const explicitIsExample =
+        Boolean(configPath) &&
+        path.resolve(expandHome(configPath)).toLowerCase() ===
+          path.resolve(exampleConfigPath).toLowerCase();
+      const isExampleFallback =
+        !explicitIsExample &&
+        (!skipUserConfig || Boolean(configPath)) &&
+        !process.env.REINS_CONFIG &&
+        path.resolve(resolved).toLowerCase() === path.resolve(exampleConfigPath).toLowerCase();
       return {
         config: {
           version: parsed.version || DEFAULT_CONFIG.version,
@@ -553,6 +578,8 @@ export function loadConfig(configPath, options = {}) {
           targets: normalizeTargetsMap(parsed.targets, globalRules),
         },
         configSource: resolved,
+        initialized: !isExampleFallback,
+        userConfigPath: defaultUserConfigPath,
       };
     }
   }
@@ -564,6 +591,8 @@ export function loadConfig(configPath, options = {}) {
       targets: normalizeTargetsMap(DEFAULT_CONFIG.targets),
     },
     configSource: 'builtin-defaults',
+    initialized: Boolean(skipUserConfig),
+    userConfigPath: defaultUserConfigPath,
   };
 }
 
@@ -587,10 +616,14 @@ export class TargetRegistry {
         targets: normalizeTargetsMap(configOverride.targets, globalRules),
       };
       this.configSource = 'override';
+      this.initialized = true;
+      this.userConfigPath = expandHome(configPath || '~/.reins/config.yaml');
     } else {
       const loaded = loadConfig(configPath, { ignoreUserConfig });
       this.config = loaded.config;
       this.configSource = loaded.configSource;
+      this.initialized = loaded.initialized;
+      this.userConfigPath = loaded.userConfigPath;
     }
   }
 

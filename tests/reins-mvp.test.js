@@ -21,6 +21,13 @@ import {
   truncateUtf8Bytes,
 } from '../src/protocol/schema.js';
 import { parseCliArgs } from '../src/cli/index.js';
+import {
+  buildAtomicDiscoverySnapshot,
+  discoverLocalHarnesses,
+  discoverSshHosts,
+  inspectExistingConfig,
+  syncLocalHarnessSkills,
+} from '../src/cli/init.js';
 import { advanceTraceOrThrow } from '../src/hub/loop-guard.js';
 import { normalizeTargetConfig, parseSimpleYaml, TargetRegistry } from '../src/hub/registry.js';
 import { TaskManager } from '../src/hub/task-manager.js';
@@ -1468,5 +1475,171 @@ test('H2H Protocol v0.1 conformance invariants: project onboarding, UNC paths, U
       else process.env[k] = savedEnv[k];
     }
     fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
+});
+
+test('reins atomic discovery: discovers local harnesses, SSH hosts, and existing config state', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-init-discover-'));
+  try {
+    fs.mkdirSync(path.join(tempHome, '.codex'), { recursive: true });
+    fs.mkdirSync(path.join(tempHome, '.dsh'), { recursive: true });
+    const sshDir = path.join(tempHome, '.ssh');
+    fs.mkdirSync(sshDir, { recursive: true });
+    const sshConfigPath = path.join(sshDir, 'config');
+    fs.writeFileSync(
+      sshConfigPath,
+      [
+        'Host *',
+        '  ServerAliveInterval 60',
+        'Host faex1',
+        '  HostName 192.168.1.50',
+        '  User pren',
+        '  Port 22',
+        'Host lisa-vps-br',
+        '  HostName 203.0.113.10',
+        '  User broca',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const discovered = discoverLocalHarnesses({
+      cwd: '/workspace/demo',
+      homedir: tempHome,
+      platform: 'linux',
+      env: {},
+      findBinary: (bin) => {
+        if (bin === 'codex') return '/usr/local/bin/codex';
+        if (bin === 'npx') return '/usr/local/bin/npx';
+        return null;
+      },
+    });
+
+    assert.equal(discovered.length, 4);
+    const codex = discovered.find((d) => d.id === 'local-codex');
+    const agy = discovered.find((d) => d.id === 'local-agy');
+    const dsh = discovered.find((d) => d.id === 'local-dsh');
+    const claude = discovered.find((d) => d.id === 'local-claude');
+
+    assert.equal(codex.detected, true);
+    assert.equal(codex.binaryPath, '/usr/local/bin/codex');
+    assert.equal(agy.detected, false);
+    assert.equal(dsh.detected, true);
+    assert.equal(claude.detected, false);
+
+    const sshHosts = discoverSshHosts(sshConfigPath);
+    assert.equal(sshHosts.length, 2);
+    assert.equal(sshHosts[0].alias, 'faex1');
+    assert.equal(sshHosts[0].user, 'pren');
+    assert.equal(sshHosts[1].alias, 'lisa-vps-br');
+
+    const missingConfigPath = path.join(tempHome, '.reins', 'config.yaml');
+    const snapshot = buildAtomicDiscoverySnapshot({
+      cwd: '/workspace/demo',
+      homedir: tempHome,
+      configPath: missingConfigPath,
+      sshConfigPath,
+    });
+    assert.equal(snapshot.initialized, false);
+    assert.equal(snapshot.configPath, missingConfigPath);
+    assert.equal(snapshot.sshHosts.length, 2);
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test('reins registry & skill sync: detects uninitialized state, respects explicit targets subset, and syncs SKILL.md', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reins-agent-init-'));
+  try {
+    // 1. Uninitialized registry (when user config file does not exist yet)
+    const missingUserConfig = path.join(tempDir, 'nonexistent-config.yaml');
+    const uninitRegistry = new TargetRegistry({ configPath: missingUserConfig, ignoreUserConfig: true });
+    assert.equal(uninitRegistry.initialized, false);
+
+    // 2. When Agent writes ~/.reins/config.yaml with only selected targets, Registry registers ONLY those targets
+    const configPath = path.join(tempDir, 'config.yaml');
+    fs.writeFileSync(
+      configPath,
+      [
+        'version: 2',
+        'targets:',
+        '  - id: local-codex',
+        '    label: Local OpenAI Codex',
+        '    harnessType: codex',
+        '    transport:',
+        '      kind: local',
+        '    driver:',
+        '      mode: codex-app-server',
+        '      command: codex',
+        '      args:',
+        '        - app-server',
+        '    workspace:',
+        '      defaultWorkdir: /workspace/reins',
+        '      allowedSyncModes:',
+        '        - local',
+        '    reinPolicy: auto-edit',
+        '    rules: |-',
+        '      ## Global Caller Preferences',
+        '      - Strategy: Quality-First (Max Reasoning Effort)',
+        '  - id: lisa-claude',
+        '    label: Lisa VPS Claude Code',
+        '    harnessType: claude-code',
+        '    transport:',
+        '      kind: ssh',
+        '      sshHost: lisa-vps-br',
+        '      connectTimeoutSec: 20',
+        '    driver:',
+        '      mode: claude-tmux',
+        '      command: /usr/local/bin/claude',
+        '      args: []',
+        '    workspace:',
+        '      defaultWorkdir: /home/broca/project',
+        '      allowedSyncModes:',
+        '        - remote-native',
+        '        - context-only',
+        '    reinPolicy: tight-rein',
+        '    model: opus',
+        '    effort: max',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const existingInfo = inspectExistingConfig(configPath);
+    assert.equal(existingInfo.exists, true);
+    assert.deepEqual(
+      existingInfo.localTargets.map((t) => t.id),
+      ['local-codex'],
+    );
+    assert.deepEqual(
+      existingInfo.remoteTargets.map((t) => t.id),
+      ['lisa-claude'],
+    );
+
+    const loadedRegistry = new TargetRegistry({ configPath });
+    assert.equal(loadedRegistry.initialized, true);
+    const targets = loadedRegistry.listTargets();
+    assert.deepEqual(
+      targets.map((t) => t.id),
+      ['local-codex', 'lisa-claude'],
+    );
+    const lisaTarget = targets.find((t) => t.id === 'lisa-claude');
+    assert.equal(lisaTarget.kind, 'claude-code');
+    assert.equal(lisaTarget.driver, 'claude-tmux');
+    assert.equal(lisaTarget.transport.host, 'lisa-vps-br');
+    assert.equal(lisaTarget.defaultCwd, '/home/broca/project');
+    assert.equal(lisaTarget.defaultPolicy, 'tight-rein');
+    assert.equal(lisaTarget.model, 'opus');
+    assert.equal(lisaTarget.effort, 'max');
+
+    // 3. Test `syncLocalHarnessSkills` syncing SKILL.md into selected harness skill folders
+    const synced = syncLocalHarnessSkills(['codex', 'antigravity'], { homedir: tempDir });
+    assert.equal(synced.length, 2);
+    for (const skillFile of synced) {
+      assert.ok(fs.existsSync(skillFile));
+      const content = fs.readFileSync(skillFile, 'utf8');
+      assert.match(content, /Agent-Hosted Initialization Flow/);
+      assert.match(content, /\/reins init/);
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

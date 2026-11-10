@@ -1,36 +1,106 @@
 # Reins
 
 > **Take the reins of all your local and remote AI coding harnesses.**  
-> Official Reference Gateway & Mobile Command Center for the [**H2H (Harness-to-Harness) Protocol v0.1**](https://github.com/Satone7/h2h-protocol) (via MCP & CLI/Skill).
+> Official Reference Gateway & Mobile Command Center for the [**H2H (Harness-to-Harness) Protocol v0.1**](https://github.com/Satone7/h2h-protocol) (via Agent Skill + Atomic CLI Primitives & MCP).
 
 ---
 
-## 1. Why "Reins"?
+## 1. Core Design Philosophy (开发理念：Agent 主导流程，项目提供文档与原子原语)
+
+Reins is built around a strict separation between **Agent-hosted workflow orchestration** and **atomic runtime primitives**:
+
+1. **Agent Hosts Long Workflows & Adapts Dynamically (长流程交由 Agent 主持并随机应变)**  
+   Human users are **never** expected to memorize or manually run `reins` CLI commands or setup scripts in a terminal. All multi-step interactive workflows—including first-time initialization (`/reins init`), local/remote harness registration, SSH environment probing, task delegation, permission steering, and error recovery—are hosted directly by the AI Agent in the chat dialog.
+2. **Workflow Documentation as Code (`skills/reins/SKILL.md`)**  
+   Instead of hardcoding brittle interactive CLI wizards or rigid state machines in JavaScript, Reins defines conversational workflows, decision trees, and target-specific caller rules (`rules`) in [`skills/reins/SKILL.md`](./skills/reins/SKILL.md). This allows the hosting Agent to ask contextual questions, adapt to non-standard environments (e.g., custom SSH jump hosts, version differences, language/timezone preferences), and write clean configurations to `~/.reins/config.yaml`.
+3. **Stateless, Atomic Primitives Only (`reins` CLI & MCP)**  
+   The `reins` executable provides only non-interactive, structured JSON (`--json`) atomic primitives that the Agent invokes behind the scenes:
+   - **Environment & Config Primitives**: `reins discover --json`, `reins probe-ssh <host> --json`, `reins sync-skills --json`, `reins targets --json`, `reins models <target> --json`
+   - **H2H Task Lifecycle Primitives**: `reins delegate`, `reins status`, `reins steer`, `reins abort`
+
+---
+
+## 2. Why "Reins"?
 
 In AI software engineering, tools such as OpenAI Codex, Antigravity (`agy`), DeepSeek Harness (`dsh`), and Claude Code are known as **Harnesses**.  
 However, when multiple horses wearing different harnesses pull the same carriage without unified **reins** in the driver's hands, they operate in isolated silos and cannot collaborate.
 
 **Reins** is the unified control plane and reference implementation of the open [**H2H Protocol (`Satone7/h2h-protocol`)**](https://github.com/Satone7/h2h-protocol) that connects them:
-- **Pass / Hand over the reins**: Let any host Harness (e.g., Antigravity or Claude Code) dynamically onboard a project and delegate subtasks to another local or remote Harness (e.g., local `codex`, `dsh`, or remote `claude-code` over SSH) via the standardized [**H2H (Harness-to-Harness) Protocol**](https://github.com/Satone7/h2h-protocol) exposed through both **MCP** and **CLI + Agent Skill (`SKILL.md`)**.
-- **Onboard projects & bind conversations**: Automatically canonicalize paths, pre-authorize workspace trust, register the repository as a first-class Project in the target Harness (e.g., Codex `project/list` $\rightarrow$ `project/create`), and bind conversations directly under that project (`snapshot.project.binding = "bound"`) so the target Harness can actively inspect repository files and human developers see the session grouped under the project in the native UI.
-- **Take the reins**: Inspect live progress, transcripts, and diffs from your terminal or mobile device at any time, and seamlessly resume H2H-created sessions directly inside each target Harness's native UI/CLI.
-- **Free rein vs. Tight rein**: Configure sandboxed autonomous execution (`free-rein`, `auto-edit`), route permission prompts back to the parent Harness (`parent-rein`), or intercept high-risk actions and push interactive approval cards to your mobile phone (`tight-rein`).
+- **Pass / Hand over the reins**: Let any host Harness (e.g., Antigravity or Claude Code) dynamically onboard a project and delegate subtasks to another local or remote Harness (e.g., local `codex`, `dsh`, or remote `claude-code` over SSH) via the standardized [**H2H (Harness-to-Harness) Protocol**](https://github.com/Satone7/h2h-protocol) exposed through both **CLI + Agent Skill (`SKILL.md`)** and **MCP**.
+- **Onboard projects & bind conversations**: Automatically canonicalize paths, pre-authorize workspace trust, register the repository as a first-class Project in the target Harness, and bind conversations directly under that project (`snapshot.project.binding = "bound"`) so the target Harness can actively inspect repository files and human developers see the session grouped under the project in the native UI.
+- **Take the reins**: Inspect live progress, transcripts, and diffs at any time, and seamlessly resume H2H-created sessions directly inside each target Harness's native UI/CLI.
+- **Free rein vs. Tight rein**: Configure sandboxed autonomous execution (`free-rein`, `auto-edit`), route permission prompts back to the parent Harness (`parent-rein`), or intercept high-risk actions (`tight-rein`).
 - **Pull the reins**: Instantly interrupt a runaway turn (`reins abort`) while keeping the underlying session alive for follow-up steering.
 
 ---
 
-## 2. Core Objectives & Evolution Roadmap
+## 3. Usage (使用指南)
+
+### 3.1 Bootstrap the Skill Once (首次安装技能)
+Clone the repository and sync the Reins skill to your local harnesses so your Agent can discover it:
+```bash
+node ./src/index.js sync-skills --json
+```
+*(Syncs `SKILL.md` into `~/.gemini/config/skills/reins/`, `~/.codex/skills/reins/`, `~/.dsh/skills/reins/`, and `~/.claude/skills/reins/`.)*
+
+### 3.2 Agent-Hosted Initialization in Chat (对话式引导初始化)
+You do **not** need to write `~/.reins/config.yaml` by hand or run a CLI wizard:
+- **Automatic First-Run Trigger**: The first time you invoke `/reins` or ask your Agent to delegate a task (e.g., *"让 codex 帮我 review 一下当前改动"*), the Agent calls `reins targets --json`, detects `"initialized": false`, and automatically hosts the initialization dialog with you.
+- **Manual Re-Initialization**: At any time, type **`/reins init`** in the chat dialog to re-run the initialization flow or add/modify targets.
+
+During the dialog flow, the Agent will:
+1. Call `reins discover --json` to auto-discover installed local harnesses (`local-codex`, `local-agy`, `local-dsh`, `local-claude`) and ask which ones you want to register.
+2. Ask about your **thinking effort & model strategy** preference (e.g., *"质量优先，采用 max 思考强度，可能会消耗更多的 token"* vs. *"均衡，交由 Agent 临场判断"* vs. *"速度与成本优先"*).
+3. Ask if you have any **special requirements (`rules`)** (e.g., preferred language, mandatory test execution after edits, read-only directories).
+4. Ask if you want to register any **remote SSH harnesses**, automatically listing aliases from `~/.ssh/config`, probing remote binary/home paths via `reins probe-ssh <host> --json`, and adapting to your remote setup.
+5. Write `~/.reins/config.yaml`, sync skills across your selected harnesses, and verify with `reins targets --json`.
+
+### 3.3 Daily Cross-Harness Delegation in Chat (日常跨 Harness 协作)
+Simply talk to your Agent in natural language:
+- *"调用 local-codex 对 `src/hub/` 做一次对抗式代码审查"*
+- *"让远程服务器上的 claude-code 帮我排查并修复这个 Linux 构建问题"*
+- *"用 `/reins init` 帮我新增一台远程 SSH 上的 DSH target"*
+
+### 3.4 Atomic CLI Primitives Reference (供 Agent 调用的原子脚本原语)
+All CLI commands are stateless atomic primitives designed to be called by the Agent with `--json`:
+
+```bash
+# 1. Environment discovery, remote SSH probing, and skill synchronization
+reins discover --json
+reins probe-ssh <sshHost> --json
+reins sync-skills codex,antigravity,dsh,claude-code --json
+
+# 2. Target & model catalog inspection
+reins targets --json
+reins models <target> --json
+
+# 3. Delegate a persistent multi-turn session or ephemeral one-shot task
+reins delegate <target> --persistent --model <model> --effort <effort> --json --prompt-stdin <<'EOF'
+Task instructions...
+EOF
+reins delegate <target> --ephemeral --preset review --json --prompt-stdin <<'EOF'
+Review instructions...
+EOF
+
+# 4. Poll status, steer (approve / reject / reply), or abort
+reins status <taskId> --wait 30 --json
+reins steer <taskId> approve --wait 60 --json
+reins steer <taskId> reply --wait 60 --json --prompt-stdin <<'EOF'
+Follow-up instructions...
+EOF
+reins abort <taskId> [--kill] --json
+```
+
+---
+
+## 4. Evolution Roadmap
 
 ### Phase 1: H2H (Harness-to-Harness) Dual-Surface Core (CLI/Skill + MCP)
 - **Dual Isomorphic Northbound Surfaces** sharing the same `reins-hub` state pool and `H2HTaskSnapshot` JSON envelope:
-  1. **CLI + Agent Skill (`reins` CLI + `skills/reins/SKILL.md`)**: Zero persistent context overhead via progressive skill disclosure; provides `reins targets|delegate|status|steer|abort|hub` commands for both AI agents and human developers.
+  1. **Agent Skill + Atomic CLI (`skills/reins/SKILL.md` + `reins` CLI)**: Zero persistent context overhead via progressive skill disclosure; Agent hosts long workflows while CLI provides atomic execution primitives.
   2. **MCP Server (`reins-mcp`)**: Exposes `reins_targets`, `reins_delegate`, `reins_status`, `reins_steer`, and `reins_abort` over standard JSON-RPC MCP.
 - **Unified Southbound `HarnessDriver` & `Transport` (`Local` / `SSH`)**:
-  - **Adaptation Priority Order**:
-    1. **OpenAI Codex (`codex`)** — via official `codex app-server --stdio` JSON-RPC 2.0 (supporting both `persistent` first-class sessions and `ephemeral` one-shot sessions, plus interactive approval interception).
-    2. **Antigravity (`antigravity`)** — via local/remote CLI & headless/ACP integration.
-    3. **DeepSeek Harness (`dsh`)** — via native `acp` (`dsh --profile acp`) and `dsh-sdk` (`dsh --profile sdk`).
-    4. **Claude Code (`claudecode`)** — via interactive `SSH + Tmux + JSONL` (`claude-tmux`) and `claude-sdk`.
+  - Supports **OpenAI Codex (`codex`)**, **Antigravity (`antigravity`)**, **DeepSeek Harness (`dsh`)**, and **Claude Code (`claude-code`)** across local subprocesses and remote SSH.
 
 ### Phase 2: Daemonization (`reins-hub`) & Instant Mobile Push Notifications
 - Persist cross-harness call trees, session state, and transcript streams in the resident **`reins-hub`** daemon.
@@ -44,11 +114,11 @@ However, when multiple horses wearing different harnesses pull the same carriage
 
 ---
 
-## 3. Repository Structure
+## 5. Repository Structure
 
 ```text
 reins/
-├── README.md                         # Project overview and vision
+├── README.md                         # Project overview, design philosophy, and usage
 ├── package.json                      # Node.js (ESM) package manifest
 ├── .env.example                      # Developer environment template (DEEPSEEK_API_KEY)
 ├── Dockerfile.test                   # Self-contained OpenSSH + Tmux + Harness test container
@@ -58,7 +128,7 @@ reins/
 │   └── reins.test.yaml               # Standardized test configuration (unified model: deepseek-flash)
 ├── skills/
 │   └── reins/
-│       └── SKILL.md                  # Standard H2H CLI Agent Skill definition
+│       └── SKILL.md                  # Agent-hosted H2H & initialization workflow skill definition
 ├── research/
 │   └── PROTOCOLS_AND_ECOSYSTEM.md    # Deep dive into MCP/A2A/ACP/AHP, Codex plugin, and DSH subagents
 ├── docs/
@@ -67,7 +137,7 @@ reins/
 ├── src/
 │   ├── index.js                      # Main entry point (CLI & SDK exports)
 │   ├── protocol/                     # H2H protocol types, envelopes, and validators
-│   ├── cli/                          # Northbound Surface 1: `reins` CLI commands
+│   ├── cli/                          # Northbound Surface 1: Atomic `reins` CLI primitives
 │   ├── mcp/                          # Northbound Surface 2: `reins-mcp` stdio/HTTP MCP server
 │   ├── hub/                          # Core state machine, registry, task router, and loop guard
 │   ├── drivers/                      # Southbound Harness drivers (Codex, Antigravity, DSH, Claude)
@@ -81,7 +151,7 @@ reins/
 
 ---
 
-## 4. Reproducible Testing & Docker Verification (`deepseek-flash`)
+## 6. Reproducible Testing & Docker Verification (`deepseek-flash`)
 
 Reins decouples developer-local machine configurations (`~/.reins/config.yaml`) from the verification environment so tests are 100% reproducible on any machine:
 
@@ -89,7 +159,7 @@ Reins decouples developer-local machine configurations (`~/.reins/config.yaml`) 
    ```bash
    npm test
    ```
-   Automatically sets `REINS_IGNORE_USER_CONFIG=1` and verifies all drivers, transports, loop guards, and H2H protocol invariants against deterministic local fixtures.
+   Automatically sets `REINS_IGNORE_USER_CONFIG=1` and verifies all drivers, transports, loop guards, atomic discovery primitives, and H2H protocol invariants against deterministic local fixtures.
 
 2. **Live LLM & Docker SSH/Tmux Verification (`deepseek-flash`)**:
    All live verification targets in [`config/reins.test.yaml`](./config/reins.test.yaml) uniformly use **`deepseek-flash`** and read **`DEEPSEEK_API_KEY`** from your local `.env` file:
@@ -106,7 +176,7 @@ Reins decouples developer-local machine configurations (`~/.reins/config.yaml`) 
 
 ---
 
-## 5. Quick Navigation (For Coding Agents)
+## 7. Quick Navigation (For Coding Agents)
 
 > **Standalone Protocol Specification Repository**:  
 > The vendor-neutral, bilingual (EN / 简体中文) H2H Protocol Specification and living Harness capability registry is maintained at **[`github.com/Satone7/h2h-protocol`](https://github.com/Satone7/h2h-protocol)** (local sibling workspace: `../h2h-protocol`).
